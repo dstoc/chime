@@ -471,7 +471,12 @@ const payloadValidation = await evaluate(`(async () => {
   let ackStarted = false;
   let ackReleased = false;
   const clickWork = worker.handleNotificationClick(
-    { data: { url: valid.url }, close: () => clickOrder.push('close') },
+    { data: {
+      id: valid.id,
+      ack_capability: valid.ack_capability,
+      expires_at: valid.expires_at,
+      url: valid.url,
+    }, close: () => clickOrder.push('close') },
     (url) => { clickOrder.push('open'); return Promise.resolve(url); },
     () => {
       ackStarted = true;
@@ -713,6 +718,221 @@ if (!dismissalBrowserChecks.concurrentPairClosed || !dismissalBrowserChecks.late
   || !dismissalBrowserChecks.clickClosedInflightDisplay || !dismissalBrowserChecks.expiredRecordRemoved
   || !dismissalBrowserChecks.boundedSet || !dismissalBrowserChecks.removalClearedSet) {
   throw new Error(`browser dismissal checks failed: ${JSON.stringify(dismissalBrowserChecks)}`);
+}
+const notificationCloseBrowserChecks = await evaluate(`(async () => {
+  const worker = await import('/sw.js');
+  const tokens = await import('/device-token.js');
+  const listeners = new Map();
+  const originalAddEventListener = window.addEventListener;
+  window.addEventListener = (type, listener) => listeners.set(type, listener);
+  try {
+    await import('/sw.js?notification-listener-test=' + Date.now());
+  } finally {
+    window.addEventListener = originalAddEventListener;
+  }
+  const closeHandler = listeners.get('notificationclose');
+  const clickHandler = listeners.get('notificationclick');
+  if (!closeHandler || !clickHandler) throw new Error('service worker did not register both notification handlers');
+
+  const originalRegistration = Object.getOwnPropertyDescriptor(window, 'registration');
+  const originalClients = Object.getOwnPropertyDescriptor(window, 'clients');
+  const visible = new Map();
+  const registration = {
+    getNotifications: async ({ tag } = {}) => tag
+      ? [...visible.entries()].filter(([key]) => key === tag).map(([, notification]) => notification)
+      : [...visible.values()],
+  };
+  Object.defineProperty(window, 'registration', { value: registration, configurable: true });
+  const openedUrls = [];
+  Object.defineProperty(window, 'clients', {
+    value: { openWindow: (url) => { openedUrls.push(url); return Promise.resolve(url); } },
+    configurable: true,
+  });
+  const restoreWindow = () => {
+    if (originalRegistration) Object.defineProperty(window, 'registration', originalRegistration);
+    else delete window.registration;
+    if (originalClients) Object.defineProperty(window, 'clients', originalClients);
+    else delete window.clients;
+  };
+
+  const now = Math.floor(Date.now() / 1000);
+  const closeId = 'K'.repeat(22);
+  const closeCapability = 'K'.repeat(43);
+  const closeExpiry = now + 3600;
+  const closeData = { id: closeId, ack_capability: closeCapability, expires_at: closeExpiry };
+  let matchingCloseCount = 0;
+  visible.set('chime-' + closeId, { close: () => { matchingCloseCount += 1; } });
+  await tokens.clearDeviceCredentials();
+  const deviceToken = 'chime_dt_' + 'T'.repeat(43);
+  await tokens.saveDeviceCredentials('dismissal-test', deviceToken);
+  const requests = [];
+  const originalFetch = window.fetch;
+  window.fetch = async (url, options) => {
+    requests.push({ url: String(url), authorization: options.headers.Authorization, body: JSON.parse(options.body) });
+    return { ok: true, status: 204 };
+  };
+  const closeWaitUntil = [];
+  closeHandler({
+    notification: { data: closeData },
+    waitUntil: (work) => closeWaitUntil.push(work),
+  });
+  const closeAttachedWork = closeWaitUntil.length === 1 && typeof closeWaitUntil[0]?.then === 'function';
+  if (closeAttachedWork) await closeWaitUntil[0];
+  const database = await new Promise((resolve, reject) => {
+    const request = indexedDB.open('chime-device', 2);
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+  const closeRecord = await new Promise((resolve, reject) => {
+    const request = database.transaction('dismissed').objectStore('dismissed').get(closeId);
+    request.onsuccess = () => resolve(request.result ?? null);
+    request.onerror = () => reject(request.error);
+  });
+  database.close();
+  const closeRememberedOriginalIdAndExpiry = closeRecord?.id === closeId && closeRecord?.expires_at === closeExpiry;
+  const closeAcknowledgedOriginalData = requests.length === 1
+    && requests[0].url === '/api/device/ack'
+    && requests[0].authorization === 'Bearer ' + deviceToken
+    && requests[0].body.id === closeId
+    && requests[0].body.capability === closeCapability;
+
+  const clickId = 'M'.repeat(22);
+  const clickData = {
+    id: clickId,
+    ack_capability: 'M'.repeat(43),
+    expires_at: now + 3500,
+    url: 'https://example.com/manual-dismissal',
+  };
+  let matchingClickCount = 0;
+  visible.set('chime-' + clickId, { close: () => { matchingClickCount += 1; } });
+  let releaseClickFetch;
+  let markClickFetchStarted;
+  const clickFetchStarted = new Promise((resolve) => { markClickFetchStarted = resolve; });
+  window.fetch = async (url, options) => {
+    requests.push({ url: String(url), authorization: options.headers.Authorization, body: JSON.parse(options.body) });
+    markClickFetchStarted();
+    return new Promise((resolve) => { releaseClickFetch = () => resolve({ ok: true, status: 204 }); });
+  };
+  const clickWaitUntil = [];
+  let clickedNotificationClosed = false;
+  clickHandler({
+    notification: { data: clickData, close: () => { clickedNotificationClosed = true; } },
+    waitUntil: (work) => clickWaitUntil.push(work),
+  });
+  const clickOpenedImmediately = clickedNotificationClosed
+    && openedUrls.length === 1 && openedUrls[0] === clickData.url;
+  await clickFetchStarted;
+  const clickOpenedBeforeAcknowledgement = clickOpenedImmediately && requests.length === 2;
+  releaseClickFetch();
+  if (clickWaitUntil.length === 1) await clickWaitUntil[0];
+  const clickAcknowledgedOriginalData = requests.length === 2
+    && requests[1].url === '/api/device/ack'
+    && requests[1].authorization === 'Bearer ' + deviceToken
+    && requests[1].body.id === clickId
+    && requests[1].body.capability === clickData.ack_capability;
+
+  const invalidId = 'J'.repeat(22);
+  let invalidMatchingCloseCount = 0;
+  visible.set('chime-' + invalidId, { close: () => { invalidMatchingCloseCount += 1; } });
+  const invalidWaitUntil = [];
+  closeHandler({
+    notification: { data: { id: invalidId, expires_at: now + 3200, ack_capability: 'invalid' } },
+    waitUntil: (work) => invalidWaitUntil.push(work),
+  });
+  if (invalidWaitUntil.length === 1) await invalidWaitUntil[0];
+  const malformedCapabilityIgnored = requests.length === 2 && invalidMatchingCloseCount === 1
+    && await tokens.isNotificationDismissed(invalidId);
+  const genericWaitUntil = [];
+  closeHandler({ notification: { data: null }, waitUntil: (work) => genericWaitUntil.push(work) });
+  if (genericWaitUntil.length === 1) await genericWaitUntil[0];
+  const genericFallbackIgnored = requests.length === 2;
+
+  await tokens.clearDeviceCredentials();
+  const unavailableId = 'N'.repeat(22);
+  let unavailableLocalClose = false;
+  visible.set('chime-' + unavailableId, { close: () => { unavailableLocalClose = true; } });
+  const unavailableWaitUntil = [];
+  closeHandler({
+    notification: {
+      data: { id: unavailableId, expires_at: now + 3100, ack_capability: 'N'.repeat(43) },
+    },
+    waitUntil: (work) => unavailableWaitUntil.push(work),
+  });
+  if (unavailableWaitUntil.length === 1) await unavailableWaitUntil[0];
+  const unavailableCredentialsKeptLocalDismissal = unavailableLocalClose
+    && requests.length === 2 && await tokens.isNotificationDismissed(unavailableId);
+
+  await tokens.saveDeviceCredentials('dismissal-test', deviceToken);
+  window.fetch = async () => { throw new Error('network unavailable'); };
+  const failedNetworkId = 'F'.repeat(22);
+  let failedNetworkLocalClose = false;
+  visible.set('chime-' + failedNetworkId, { close: () => { failedNetworkLocalClose = true; } });
+  const failedNetworkWaitUntil = [];
+  closeHandler({
+    notification: {
+      data: { id: failedNetworkId, expires_at: now + 3000, ack_capability: 'F'.repeat(43) },
+    },
+    waitUntil: (work) => failedNetworkWaitUntil.push(work),
+  });
+  if (failedNetworkWaitUntil.length === 1) await failedNetworkWaitUntil[0];
+  const failedNetworkKeptLocalDismissal = failedNetworkLocalClose
+    && await tokens.isNotificationDismissed(failedNetworkId);
+
+  let storageFailureLocalClose = false;
+  let storageFailureAcknowledged = false;
+  const storageFailureId = 'S'.repeat(22);
+  await worker.handleNotificationDismissal({
+    data: { id: storageFailureId, expires_at: now + 2900, ack_capability: 'S'.repeat(43) },
+  }, async (data) => {
+    storageFailureAcknowledged = data.id === storageFailureId;
+  }, {
+    getNotifications: async () => [{ close: () => { storageFailureLocalClose = true; } }],
+  }, async () => { throw new Error('IndexedDB unavailable'); });
+  const storageFailureStayedBestEffort = storageFailureLocalClose && storageFailureAcknowledged;
+
+  let receivedDismissClosed = false;
+  const requestCountBeforeDismissPush = requests.length;
+  await worker.handlePushPayload({
+    getNotifications: async () => [{ close: () => { receivedDismissClosed = true; } }],
+    showNotification: async () => { throw new Error('dismiss push must not display a notification'); },
+  }, { type: 'dismiss', version: 1, id: 'D'.repeat(22), expires_at: now + 2800 });
+  const receivedDismissDidNotAcknowledge = receivedDismissClosed && requests.length === requestCountBeforeDismissPush;
+
+  window.fetch = originalFetch;
+  restoreWindow();
+  await tokens.clearDeviceCredentials();
+  return {
+    closeAttachedWork,
+    closeRememberedOriginalIdAndExpiry,
+    closeAcknowledgedOriginalData,
+    closeMatchedLocalNotification: matchingCloseCount === 1,
+    clickOpenedImmediately,
+    clickOpenedBeforeAcknowledgement,
+    clickAcknowledgedOriginalData,
+    clickMatchedLocalNotification: matchingClickCount === 1,
+    malformedCapabilityIgnored,
+    genericFallbackIgnored,
+    unavailableCredentialsKeptLocalDismissal,
+    failedNetworkKeptLocalDismissal,
+    storageFailureStayedBestEffort,
+    receivedDismissDidNotAcknowledge,
+  };
+})()`);
+if (!notificationCloseBrowserChecks.closeAttachedWork
+  || !notificationCloseBrowserChecks.closeRememberedOriginalIdAndExpiry
+  || !notificationCloseBrowserChecks.closeAcknowledgedOriginalData
+  || !notificationCloseBrowserChecks.closeMatchedLocalNotification
+  || !notificationCloseBrowserChecks.clickOpenedImmediately
+  || !notificationCloseBrowserChecks.clickOpenedBeforeAcknowledgement
+  || !notificationCloseBrowserChecks.clickAcknowledgedOriginalData
+  || !notificationCloseBrowserChecks.clickMatchedLocalNotification
+  || !notificationCloseBrowserChecks.malformedCapabilityIgnored
+  || !notificationCloseBrowserChecks.genericFallbackIgnored
+  || !notificationCloseBrowserChecks.unavailableCredentialsKeptLocalDismissal
+  || !notificationCloseBrowserChecks.failedNetworkKeptLocalDismissal
+  || !notificationCloseBrowserChecks.storageFailureStayedBestEffort
+  || !notificationCloseBrowserChecks.receivedDismissDidNotAcknowledge) {
+  throw new Error(`notification close browser checks failed: ${JSON.stringify(notificationCloseBrowserChecks)}`);
 }
 await cdp('ServiceWorker.enable');
 await evaluate(`navigator.serviceWorker.register('/sw.js', { type: 'module' }).then(() => navigator.serviceWorker.ready)`);
@@ -1246,6 +1466,7 @@ console.log(JSON.stringify({
   deviceRemoval: removedDevice.body.devices.length,
   serviceWorkerPayloadValidation: payloadValidation,
   dismissalBrowserChecks,
+  notificationCloseBrowserChecks,
   notificationDisplay: displayedPush,
   dismissalPush: dismissedPush,
   delayedPushStayedClosed,
