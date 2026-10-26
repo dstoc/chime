@@ -23,6 +23,7 @@ const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 #[derive(Debug, Parser)]
 #[command(
     name = "chime",
+    version,
     about = "Send notifications with Chime",
     after_help = "Examples:\n  chime send --title 'Build completed' --body 'All checks passed'\n  chime send --title 'Render ready' --image ./render.png --url https://example.com/result\n  chime send --title 'Build completed' --image-url https://example.com/build.png"
 )]

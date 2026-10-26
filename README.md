@@ -1,24 +1,28 @@
 # Chime
 
-Chime sends short messages from a command line or web application to browsers you enroll. Notifications can include an image and a link to open when clicked. Administrators use passkeys to manage receiving devices and revocable send keys. Chime keeps no notification history.
+Chime sends short messages from a command line or web application to enrolled browsers. Notifications can include an image and a link. Administrators use passkeys to manage receiving devices and revocable send keys. Chime keeps no notification history.
 
-## Build and run
+## Run Chime
 
-Build the server and CLI from the repository:
+For a rootless Podman deployment, install the published Chime image with the two-container Tailscale example in the [operator guide](docs/operator-guide.md). The deployment does not build source on the host.
+
+Download the Linux x86-64 CLI from a [GitHub release](https://github.com/dstoc/chime/releases). Replace `0.2.0` below with the version you selected:
 
 ```sh
-cargo build --workspace --locked --release
-mkdir -m 0700 data
-target/release/chime-server \
-  --origin https://chime.example-tailnet.ts.net \
-  --data-dir ./data
+VERSION=0.2.0
+ARCHIVE="chime-v${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+BASE="https://github.com/dstoc/chime/releases/download/v${VERSION}"
+mkdir -p "$HOME/.local/bin" "$HOME/.cache/chime"
+curl --fail --location --output "$HOME/.cache/chime/$ARCHIVE" "$BASE/$ARCHIVE"
+curl --fail --location --output "$HOME/.cache/chime/$ARCHIVE.sha256" "$BASE/$ARCHIVE.sha256"
+(cd "$HOME/.cache/chime" && sha256sum --check "$ARCHIVE.sha256")
+tar -xzf "$HOME/.cache/chime/$ARCHIVE" -C "$HOME/.local/bin" chime
+"$HOME/.local/bin/chime" --version
 ```
 
-Put the server behind HTTPS at the exact configured origin and forward requests to its loopback listener on port 8080. For a rootless Podman and Tailscale deployment, use the [operator guide](docs/operator-guide.md).
+Verify the archive's GitHub provenance and the corresponding image digest before installation. The [release guide](docs/releases.md) gives copyable checksum, digest, and `gh attestation verify` commands.
 
-On first start, the server prints a one-use setup code to its console. Enter it at the HTTPS site and register an administrator passkey. The code expires after 15 minutes; keep the console output private. On each receiving browser, choose **Enable notifications**, allow notifications, and approve enrollment with a passkey. On iPhone or iPad, add the site to the Home Screen and open that app first.
-
-Create a named send key in the browser. Chime shows the key once. Save it in a protected config file such as `~/.config/chime/config.json` and set the file mode to `0600`:
+Create a send key in the browser and save it in a protected config file such as `~/.config/chime/config.json` with mode `0600`:
 
 ```json
 {
@@ -30,8 +34,8 @@ Create a named send key in the browser. Chime shows the key once. Save it in a p
 Send a text notification or upload an image with a click URL:
 
 ```sh
-target/release/chime send --title 'Build completed' --body 'All checks passed'
-target/release/chime send --title 'Render ready' --image ./render.png --url https://example.com/result
+chime send --title 'Build completed' --body 'All checks passed'
+chime send --title 'Render ready' --image ./render.png --url https://example.com/result
 ```
 
 The CLI also accepts `CHIME_URL` and `CHIME_API_KEY`; environment values override the config file. Do not put a key in a command argument. Revoke a key in the browser when it is no longer needed.
@@ -46,6 +50,7 @@ The [Send API and CLI section](docs/proposals/chime-proposal.md#send-api-and-cli
 
 ## More information
 
-- [Operator guide](docs/operator-guide.md): install, setup, update, reset, backup, and troubleshooting.
-- [Cross-device dismissal amendment](docs/proposals/chime-cross-device-dismissal.md): behavior, ordering, and failure limits.
+- [Operator guide](docs/operator-guide.md): install the published image, set up Tailscale, update, reset, and back up the deployment.
+- [Release guide](docs/releases.md): release operations, checksums, image digests, and provenance verification.
 - [Development checks](docs/development.md): Rust, browser, and deployment checks, including what local fixtures do not prove.
+- [Cross-device dismissal amendment](docs/proposals/chime-cross-device-dismissal.md): behavior, ordering, and failure limits.

@@ -5,7 +5,7 @@ BindsTo=chime-tailscale.service
 PartOf=chime-tailscale.service
 
 [Container]
-Image=chime.build
+Image=ghcr.io/dstoc/chime:0.2.0
 ContainerName=chime-server
 Network=chime-tailscale.container
 User=10001:10001

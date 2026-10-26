@@ -17,6 +17,12 @@ The required `test` workflow checks the deployment files with Python's standard 
 python3 -m unittest discover --start-directory tests/deployment --pattern 'test_*.py'
 ```
 
+The same workflow checks the Release Please version selectors, shared Cargo versions, deterministic CLI archive, and release/deployment documentation:
+
+```sh
+python3 -m unittest discover --start-directory tests/release --pattern 'test_*.py'
+```
+
 Where rootless Podman is available, build the image with `podman build --tag localhost/chime:0.1.0 .` and follow the [operator guide](operator-guide.md) to validate the Quadlet units. The static check does not validate Podman Quadlet parsing, rootless runtime permissions, SELinux labels, a reboot, or a real tailnet connection.
 
 ## Local passkey browser check
