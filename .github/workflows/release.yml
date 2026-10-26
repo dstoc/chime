@@ -265,10 +265,16 @@ jobs:
               cd "$reuse_dir"
               sha256sum --check "$CLI_ARCHIVE.sha256"
             )
+            # The ref-bound attestation identifies the workflow, not the
+            # checked-out release source. Compare with our tag-based rebuild.
+            if ! cmp --silent "dist/$CLI_ARCHIVE" "$reuse_dir/$CLI_ARCHIVE"; then
+              echo "Existing CLI asset differs from the freshly built release source" >&2
+              exit 1
+            fi
             gh attestation verify "$reuse_dir/$CLI_ARCHIVE" \
               --repo "$GITHUB_REPOSITORY" \
               --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
-              --source-digest "$SOURCE_SHA"
+              --source-ref refs/heads/main
             cp "$reuse_dir/$CLI_ARCHIVE" "dist/$CLI_ARCHIVE"
             cp "$reuse_dir/$CLI_ARCHIVE.sha256" "dist/$CLI_ARCHIVE.sha256"
             echo "reuse=true" >> "$GITHUB_OUTPUT"
@@ -385,7 +391,7 @@ jobs:
           if ! gh attestation verify "oci://ghcr.io/dstoc/chime@$IMAGE_DIGEST" \
             --repo "$GITHUB_REPOSITORY" \
             --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
-            --source-digest "$SOURCE_SHA" \
+            --source-ref refs/heads/main \
             --bundle-from-oci; then
             {
               echo "### Recovery required"
@@ -421,11 +427,11 @@ jobs:
           gh attestation verify "dist/$CLI_ARCHIVE" \
             --repo "$GITHUB_REPOSITORY" \
             --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
-            --source-digest "$SOURCE_SHA"
+            --source-ref refs/heads/main
           gh attestation verify "oci://ghcr.io/dstoc/chime@$IMAGE_DIGEST" \
             --repo "$GITHUB_REPOSITORY" \
             --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
-            --source-digest "$SOURCE_SHA" \
+            --source-ref refs/heads/main \
             --bundle-from-oci
 
       - name: Verify anonymous AMD64 pull and server response
