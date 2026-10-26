@@ -252,11 +252,9 @@ jobs:
           reuse_dir="$RUNNER_TEMP/chime-cli-reuse"
           mkdir -p "$reuse_dir"
           if [[ "$archive_count" -eq 1 ]]; then
-            gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
-              --pattern "$CLI_ARCHIVE" --dir "$reuse_dir"
+            gh api "repos/$GITHUB_REPOSITORY/releases/assets/$(jq -er --arg name "$CLI_ARCHIVE" '[.[][] | select(.name == $name and .state == "uploaded") | .id] | if length == 1 then .[0] else error("Invalid CLI asset") end' <<< "$assets")" -H "Accept: application/octet-stream" > "$reuse_dir/$CLI_ARCHIVE"
             if [[ "$checksum_count" -eq 1 ]]; then
-              gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
-                --pattern "$CLI_ARCHIVE.sha256" --dir "$reuse_dir"
+              gh api "repos/$GITHUB_REPOSITORY/releases/assets/$(jq -er --arg name "$CLI_ARCHIVE.sha256" '[.[][] | select(.name == $name and .state == "uploaded") | .id] | if length == 1 then .[0] else error("Invalid checksum asset") end' <<< "$assets")" -H "Accept: application/octet-stream" > "$reuse_dir/$CLI_ARCHIVE.sha256"
             else
               (
                 cd "$reuse_dir"
@@ -275,8 +273,7 @@ jobs:
             cp "$reuse_dir/$CLI_ARCHIVE.sha256" "dist/$CLI_ARCHIVE.sha256"
             echo "reuse=true" >> "$GITHUB_OUTPUT"
           elif [[ "$checksum_count" -eq 1 ]]; then
-            gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
-              --pattern "$CLI_ARCHIVE.sha256" --dir "$reuse_dir"
+            gh api "repos/$GITHUB_REPOSITORY/releases/assets/$(jq -er --arg name "$CLI_ARCHIVE.sha256" '[.[][] | select(.name == $name and .state == "uploaded") | .id] | if length == 1 then .[0] else error("Invalid checksum asset") end' <<< "$assets")" -H "Accept: application/octet-stream" > "$reuse_dir/$CLI_ARCHIVE.sha256"
             cp "dist/$CLI_ARCHIVE" "$reuse_dir/$CLI_ARCHIVE"
             (
               cd "$reuse_dir"
@@ -514,14 +511,19 @@ jobs:
             count=$(jq 'length' <<< "$matches")
             if [[ "$count" -eq 0 ]]; then
               assert_draft
-              gh release upload "$TAG" "$path" --repo "$GITHUB_REPOSITORY"
+              gh api --method POST --hostname uploads.github.com \
+                "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?name=$name" \
+                -H "Content-Type: application/octet-stream" --input "$path" >/dev/null
             elif [[ "$count" -ne 1 ]]; then
               echo "Release has duplicate assets named $name; refusing to replace them" >&2
               exit 1
             fi
             download_dir=$(mktemp -d)
-            gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
-              --pattern "$name" --dir "$download_dir"
+            assets=$(gh api --paginate --slurp \
+              "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?per_page=100")
+            asset_id=$(jq -er --arg name "$name" '[.[][] | select(.name == $name and .state == "uploaded") | .id] | if length == 1 then .[0] else error("Invalid asset") end' <<< "$assets")
+            gh api "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" \
+              -H "Accept: application/octet-stream" > "$download_dir/$name"
             if ! cmp --silent "$path" "$download_dir/$name"; then
               echo "Existing draft asset $name differs from the deterministic local artifact; refusing to replace it" >&2
               rm -rf "$download_dir"
@@ -571,8 +573,8 @@ jobs:
           PY
           release_json=$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID")
           jq -e --arg tag "$TAG" '.tag_name == $tag and .draft == true' <<< "$release_json" >/dev/null
-          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" \
-            --notes-file "$RUNNER_TEMP/release-notes.md"
+          gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
+            --raw-field "body=$(cat "$RUNNER_TEMP/release-notes.md")" >/dev/null
 
       - name: Publish the complete verified release
         env:
