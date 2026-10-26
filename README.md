@@ -59,6 +59,8 @@ Cross-origin browser sends are allowed on `/api/notify` only. The endpoint accep
 
 The CLI also reads `CHIME_URL` and `CHIME_API_KEY`; environment values override the config file. Use `--config PATH` or `CHIME_CONFIG` to select a different file. The CLI reports push-provider acceptance, not device receipt, and exits with a nonzero status for partial failure, total failure, or no devices.
 
+Clicking a notification closes it on that device and opens its validated HTTPS link immediately. An open Chime page can close matching notifications on other enrolled devices, and a page that reconnects can reconcile them for up to one hour. This depends on those devices reaching Chime. Closed pages do not receive silent dismissal pushes, and acknowledgements are lost if Chime restarts or evicts their temporary state. A push accepted before an acknowledgement can arrive later and show again. Chime does not guarantee background dismissal or keep an offline acknowledgement queue.
+
 The browser provides send-key creation and revocation, device enrollment and removal, and administrator passkey management. Enrollment accepts HTTPS push endpoints from Google FCM, Mozilla Push, and Apple Web Push. Other providers are rejected. Chime limits titles to 200 UTF-8 bytes, bodies to 1,500 bytes, and URLs to 2,048 bytes. JSON requests are limited to 16 KiB; multipart uploads are limited to 5 MiB plus 16 KiB of overhead. Chime supports up to 64 receiving devices, keeps provider messages for one hour, and limits the server to 60 sends per minute, four sends at once, and eight provider requests at once.
 
 If the setup code expires or is lost, or if initial registration was cancelled after setup began, stop Chime and replace the code locally:

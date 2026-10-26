@@ -15,8 +15,9 @@ use axum::{
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use include_dir::{Dir, include_dir};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::{convert::Infallible, time::Duration};
 
 static WEB_ASSETS: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../../web");
 
@@ -43,6 +44,9 @@ pub fn router(admin: AdminState, notifications: NotifyState, images: ImageStore)
                 .options(notify_options)
                 .layer(DefaultBodyLimit::max(MAX_MULTIPART_BODY_BYTES)),
         )
+        .route("/api/device/ack", post(device_acknowledge))
+        .route("/api/device/reconcile", post(device_reconcile))
+        .route("/api/device/events", get(device_events))
         .route("/api/images/{capability}", get(image))
         .route("/api/setup/start", post(setup_start))
         .route("/api/setup/finish", post(setup_finish))
@@ -74,6 +78,118 @@ async fn not_found(uri: Uri) -> Response {
         return asset_response(path);
     }
     error_response(StatusCode::NOT_FOUND, "Not found.")
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AcknowledgeRequest {
+    id: String,
+    capability: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReconcileRequest {
+    ids: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct ReconcileResponse {
+    acknowledged: Vec<String>,
+}
+
+async fn device_acknowledge(State(state): State<AppState>, request: Request<Body>) -> Response {
+    let Some(token) = bearer_device_token(&request) else {
+        return device_token_error();
+    };
+    let body = match parse_json::<AcknowledgeRequest>(request).await {
+        Ok(body) => body,
+        Err(status) => return error_response(status, "The request body is invalid."),
+    };
+    match state
+        .notify
+        .acknowledge(token, body.id, body.capability)
+        .await
+    {
+        Ok(()) => {
+            let mut response = Response::new(Body::empty());
+            *response.status_mut() = StatusCode::NO_CONTENT;
+            response
+        }
+        Err(error) => error_response(error.status, error.message),
+    }
+}
+
+async fn device_reconcile(State(state): State<AppState>, request: Request<Body>) -> Response {
+    let Some(token) = bearer_device_token(&request) else {
+        return device_token_error();
+    };
+    let body = match parse_json::<ReconcileRequest>(request).await {
+        Ok(body) => body,
+        Err(status) => return error_response(status, "The request body is invalid."),
+    };
+    match state.notify.reconcile(token, body.ids).await {
+        Ok(acknowledged) => api_json(StatusCode::OK, ReconcileResponse { acknowledged }),
+        Err(error) => error_response(error.status, error.message),
+    }
+}
+
+async fn device_events(State(state): State<AppState>, request: Request<Body>) -> Response {
+    let Some(token) = bearer_device_token(&request) else {
+        return device_token_error();
+    };
+    let event_stream = match state.notify.event_stream(token).await {
+        Ok(stream) => stream,
+        Err(error) => return error_response(error.status, error.message),
+    };
+    let stream = futures_lite::stream::unfold(
+        (
+            event_stream.receiver,
+            event_stream.closed,
+            event_stream._lease,
+        ),
+        |(mut receiver, mut closed, lease)| async move {
+            tokio::select! {
+                changed = closed.changed() => {
+                    if changed.is_err() || *closed.borrow() {
+                        None
+                    } else {
+                        Some((Ok::<_, Infallible>(b": keep-alive\n\n".to_vec()), (receiver, closed, lease)))
+                    }
+                }
+                event = receiver.recv() => {
+                    event.map(|event| (Ok(event.into_bytes()), (receiver, closed, lease)))
+                }
+                _ = tokio::time::sleep(Duration::from_secs(15)) => {
+                    Some((Ok::<_, Infallible>(b": keep-alive\n\n".to_vec()), (receiver, closed, lease)))
+                }
+            }
+        },
+    );
+    let mut response = Response::new(Body::from_stream(stream));
+    *response.status_mut() = StatusCode::OK;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/event-stream; charset=utf-8"),
+    );
+    response
+}
+
+fn bearer_device_token(request: &Request<Body>) -> Option<String> {
+    let value = request
+        .headers()
+        .get(header::AUTHORIZATION)?
+        .to_str()
+        .ok()?;
+    let token = value.strip_prefix("Bearer chime_dt_")?;
+    Some(format!("chime_dt_{token}"))
+}
+
+fn device_token_error() -> Response {
+    error_response(
+        StatusCode::UNAUTHORIZED,
+        "A valid Chime device token is required.",
+    )
 }
 
 async fn setup_status(State(state): State<AppState>) -> Response {
@@ -355,8 +471,24 @@ async fn admin_finish(State(state): State<AppState>, request: Request<Body>) -> 
         Ok(body) => body,
         Err(status) => return error_response(status, "The request body is invalid."),
     };
+    let _device_authority = state.notify.device_authority().await;
     match state.admin.finish_admin_operation(body).await {
-        Ok(response) => api_json(StatusCode::OK, response),
+        Ok(response) => {
+            match &response {
+                AdminResponse::Devices { devices } => {
+                    let active_ids = devices
+                        .iter()
+                        .map(|device| device.id.clone())
+                        .collect::<Vec<_>>();
+                    state.notify.invalidate_removed_devices(&active_ids);
+                }
+                AdminResponse::DeviceEnrolled { device, .. } => {
+                    state.notify.invalidate_device(&device.id);
+                }
+                _ => {}
+            }
+            api_json(StatusCode::OK, response)
+        }
         Err(error) => admin_error(error),
     }
 }
@@ -571,6 +703,38 @@ mod tests {
         )
     }
 
+    async fn acknowledgement_app() -> (axum::Router, tempfile::TempDir, Store, NotifyState) {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(&directory.path().join("state")).unwrap();
+        let token = format!("chime_dt_{}", URL_SAFE_NO_PAD.encode([6_u8; 32]));
+        let digest = Sha256::digest(token.as_bytes()).to_vec();
+        store
+            .database()
+            .run(move |connection| {
+                connection.execute(
+                    "INSERT INTO receiving_devices
+                     (id, name, endpoint, p256dh, auth, token_digest,
+                      created_at, updated_at, revision)
+                     VALUES ('BBBBBBBBBBBBBBBBBBBBBB', 'test device',
+                       'https://fcm.googleapis.com/test/device', '', '', ?1,
+                       unixepoch(), unixepoch(), 1)",
+                    rusqlite::params![digest],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let origin = Origin::from_str("https://chime.example-tailnet.ts.net").unwrap();
+        let images = ImageStore::new(store.clone()).unwrap();
+        let notify = NotifyState::new(store.clone(), Arc::new(WebPushTransport::new().unwrap()));
+        let app = router(
+            AdminState::new(store.clone(), &origin).unwrap(),
+            notify.clone(),
+            images,
+        );
+        (app, directory, store, notify)
+    }
+
     #[tokio::test]
     async fn embedded_assets_have_types_and_security_headers() {
         let (app, _directory, _code, _secret, _images, _store) = app().await;
@@ -681,6 +845,174 @@ mod tests {
                 .headers()
                 .contains_key("access-control-allow-origin")
         );
+    }
+
+    #[tokio::test]
+    async fn device_ack_routes_require_headers_bound_capabilities_and_bounded_batches() {
+        let (app, _directory, store, notify) = acknowledgement_app().await;
+        let token = format!("chime_dt_{}", URL_SAFE_NO_PAD.encode([6_u8; 32]));
+        let id = URL_SAFE_NO_PAD.encode([7_u8; 16]);
+        let capability = URL_SAFE_NO_PAD.encode([8_u8; 32]);
+        notify
+            .remember_acknowledgement(id.clone(), &capability)
+            .await;
+
+        let query_token = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/device/events?token={token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(query_token.status(), StatusCode::UNAUTHORIZED);
+
+        let wrong_token = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/device/ack")
+                    .header("authorization", "Bearer chime_dt_wrong")
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"id":"{id}","capability":"{capability}"}}"#
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wrong_token.status(), StatusCode::UNAUTHORIZED);
+
+        let wrong_capability = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/device/ack")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"id":"{id}","capability":"{}"}}"#,
+                        URL_SAFE_NO_PAD.encode([9_u8; 32])
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wrong_capability.status(), StatusCode::NOT_FOUND);
+
+        for _ in 0..2 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/device/ack")
+                        .header("authorization", format!("Bearer {token}"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(format!(
+                            r#"{{"id":"{id}","capability":"{capability}"}}"#
+                        )))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        }
+
+        let reconciliation = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/device/reconcile")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(r#"{{"ids":["{id}"]}}"#)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reconciliation.status(), StatusCode::OK);
+        assert_eq!(
+            axum::body::to_bytes(reconciliation.into_body(), MAX_JSON_BODY_BYTES)
+                .await
+                .unwrap(),
+            format!(r#"{{"acknowledged":["{id}"]}}"#).as_bytes()
+        );
+
+        let too_many = vec![id.clone(); 101];
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/device/reconcile")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "ids": too_many }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        store
+            .database()
+            .run(|connection| {
+                connection.execute(
+                    "DELETE FROM receiving_devices WHERE id = 'BBBBBBBBBBBBBBBBBBBBBB'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let revoked = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/device/reconcile")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(r#"{{"ids":["{id}"]}}"#)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(revoked.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn event_streams_use_sse_content_type_and_enforce_per_device_limit() {
+        let (app, _directory, _store, _notify) = acknowledgement_app().await;
+        let token = format!("chime_dt_{}", URL_SAFE_NO_PAD.encode([6_u8; 32]));
+        let request = || {
+            Request::builder()
+                .uri("/api/device/events")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap()
+        };
+        let first = app.clone().oneshot(request()).await.unwrap();
+        let second = app.clone().oneshot(request()).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(
+            first.headers()["content-type"],
+            "text/event-stream; charset=utf-8"
+        );
+        assert_eq!(first.headers()["cache-control"], "no-store");
+        assert_eq!(second.status(), StatusCode::OK);
+        drop(first);
+        let replacement = app.clone().oneshot(request()).await.unwrap();
+        assert_eq!(replacement.status(), StatusCode::OK);
+        let third = app.oneshot(request()).await.unwrap();
+        assert_eq!(third.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 
     #[tokio::test]

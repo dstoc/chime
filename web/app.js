@@ -4,6 +4,7 @@ import {
   getDeviceCredentials,
   saveDeviceCredentials,
 } from "/device-token.js";
+import { startAcknowledgementSync, stopAcknowledgementSync } from "/acknowledgements.js";
 
 const setupSection = document.querySelector("#setup");
 const adminSection = document.querySelector("#admin");
@@ -201,6 +202,7 @@ async function runAdmin(operation) {
         renderDevices(result.devices);
         try {
           await saveDeviceCredentials(result.device.id, result.token);
+          startAcknowledgementSync();
           deviceStatus.textContent = "This browser is enrolled. Its private device token is stored in this site's IndexedDB.";
           say("Browser enrolled. It can now receive text notifications.");
         } catch (error) {
@@ -232,10 +234,12 @@ async function removeDevice(item) {
       throw new Error("The browser kept its push subscription.");
     }
     await clearDeviceCredentials();
+    stopAcknowledgementSync();
     deviceStatus.textContent = "This browser was removed and its push subscription was disabled.";
     say("Device removed.");
   } catch (error) {
     await clearDeviceCredentials().catch(() => {});
+    stopAcknowledgementSync();
     deviceStatus.textContent = "The server removed this device, but browser notification settings may still need attention.";
     say(error.message);
   }
@@ -417,6 +421,7 @@ async function initialize() {
     const credentials = await getDeviceCredentials().catch(() => null);
     if (credentials) {
       deviceStatus.textContent = "This browser has a stored device token. Use View devices to check its server enrollment.";
+      if (Notification.permission === "granted") startAcknowledgementSync();
     }
   } catch (error) {
     serverStatus.textContent = "Chime could not be reached.";

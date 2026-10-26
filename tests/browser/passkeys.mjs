@@ -452,6 +452,30 @@ const payloadValidation = await evaluate(`(async () => {
   let closeCount = 0;
   await worker.openNotificationUrl({ data: { url: valid.url }, close: () => { closeCount += 1; } }, async (url) => opened.push(url));
   await worker.openNotificationUrl({ data: { url: 'javascript:alert(1)' }, close: () => { closeCount += 1; } }, async (url) => opened.push(url));
+  let noUrlCloseCount = 0;
+  const noUrlOpened = await worker.openNotificationUrl({ data: {}, close: () => { noUrlCloseCount += 1; } }, async (url) => opened.push(url));
+  const tokens = await import('/device-token.js');
+  const deviceToken = 'chime_dt_' + 'A'.repeat(43);
+  await tokens.saveDeviceCredentials('fixture-device', deviceToken);
+  const originalFetch = window.fetch;
+  let acknowledgementRequest = null;
+  window.fetch = async (url, options) => {
+    acknowledgementRequest = { url: String(url), authorization: options.headers.Authorization, body: JSON.parse(options.body) };
+    return { ok: true, status: 204 };
+  };
+  await worker.acknowledgeNotification({ id: valid.id, ack_capability: valid.ack_capability });
+  window.fetch = originalFetch;
+  await tokens.clearDeviceCredentials();
+  const clickOrder = [];
+  let releaseAck;
+  const clickWork = worker.handleNotificationClick(
+    { data: { url: valid.url }, close: () => clickOrder.push('close') },
+    (url) => { clickOrder.push('open'); return Promise.resolve(url); },
+    () => { clickOrder.push('ack'); return new Promise(resolve => { releaseAck = resolve; }); },
+  );
+  const openedBeforeAckCompleted = clickOrder.join(',') === 'close,open,ack';
+  releaseAck();
+  await clickWork;
   return {
     valid: validatePayload(valid),
     oldVersion: validatePayload({ ...valid, version: 2 }),
@@ -462,12 +486,90 @@ const payloadValidation = await evaluate(`(async () => {
     imageFallback: calls.length === 2 && calls[0].options.image === valid.image_url
       && calls[1].options.image === undefined && calls[1].options.body === valid.body,
     click: opened.length === 1 && opened[0] === valid.url && closeCount === 2,
+    openedBeforeAckCompleted,
+    noUrlClosedWithoutNavigation: noUrlOpened === null && noUrlCloseCount === 1 && opened.length === 1,
+    acknowledgementHeaderOnly: acknowledgementRequest?.url === '/api/device/ack'
+      && acknowledgementRequest.authorization === 'Bearer ' + deviceToken
+      && acknowledgementRequest.body.id === valid.id
+      && acknowledgementRequest.body.capability === valid.ack_capability,
   };
 })()`);
 if (!payloadValidation.valid || payloadValidation.oldVersion || payloadValidation.expired
   || payloadValidation.unsafeExtra || payloadValidation.unsafeImage || payloadValidation.unsafeClick
-  || !payloadValidation.imageFallback || !payloadValidation.click) {
+  || !payloadValidation.imageFallback || !payloadValidation.click || !payloadValidation.openedBeforeAckCompleted
+  || !payloadValidation.noUrlClosedWithoutNavigation || !payloadValidation.acknowledgementHeaderOnly) {
   throw new Error(`service-worker payload validation failed: ${JSON.stringify(payloadValidation)}`);
+}
+const acknowledgementBrowserChecks = await evaluate(`(async () => {
+  const acknowledgements = await import('/acknowledgements.js');
+  const ids = Array.from({ length: 205 }, (_, index) => 'A'.repeat(18) + index.toString(36).padStart(4, '0'));
+  const closed = [];
+  const notifications = ids.map(id => ({ data: { id }, close: () => closed.push(id) }));
+  const registration = {
+    getNotifications: async ({ tag } = {}) => tag
+      ? notifications.filter(item => tag === 'chime-' + item.data.id)
+      : notifications,
+  };
+  const originalFetch = window.fetch;
+  const batches = [];
+  const urls = [];
+  let authorizationHeader = null;
+  window.fetch = async (url, options) => {
+    urls.push(String(url));
+    authorizationHeader = options.headers.Authorization;
+    const request = JSON.parse(options.body);
+    batches.push(request.ids.length);
+    return { ok: true, json: async () => ({ acknowledged: [request.ids[0], 'Z'.repeat(22)] }) };
+  };
+  try {
+    await acknowledgements.reconcileVisible(registration, 'chime_dt_fixture');
+  } finally {
+    window.fetch = originalFetch;
+  }
+
+  const eventId = 'B'.repeat(22);
+  const eventClosed = [];
+  const eventRegistration = {
+    getNotifications: async ({ tag } = {}) => tag === 'chime-' + eventId
+      ? [{ data: { id: eventId }, close: () => eventClosed.push(eventId) }]
+      : [],
+  };
+  const encoder = new TextEncoder();
+  const splitEvent = new ReadableStream({ start(controller) {
+    controller.enqueue(encoder.encode('event: acknowledged\\ndata: {"id":"' + eventId));
+    controller.enqueue(encoder.encode('"}\\n\\n'));
+    controller.close();
+  } });
+  await acknowledgements.readEvents(splitEvent, eventRegistration);
+  const unknownEvent = new ReadableStream({ start(controller) {
+    controller.enqueue(encoder.encode('event: acknowledged\\ndata: {"id":"' + 'C'.repeat(22) + '"}\\n\\n'));
+    controller.close();
+  } });
+  await acknowledgements.readEvents(unknownEvent, eventRegistration);
+  const oversized = new ReadableStream({ start(controller) {
+    controller.enqueue(new Uint8Array(5000).fill(65));
+    controller.close();
+  } });
+  let oversizedRejected = false;
+  try { await acknowledgements.readEvents(oversized, eventRegistration); } catch { oversizedRejected = true; }
+  return {
+    batchSizes: batches,
+    batchLimit: batches.every(size => size <= 100),
+    closedCount: closed.length,
+    tokenStayedOutOfUrl: urls.every(url => !url.includes('chime_dt_fixture')),
+    tokenWasHeader: authorizationHeader === 'Bearer chime_dt_fixture',
+    splitSseClosed: eventClosed.length === 1,
+    oversizedRejected,
+  };
+})()`);
+if (acknowledgementBrowserChecks.batchSizes.join('/') !== '100/100/5'
+  || !acknowledgementBrowserChecks.batchLimit
+  || acknowledgementBrowserChecks.closedCount !== 3
+  || !acknowledgementBrowserChecks.tokenStayedOutOfUrl
+  || !acknowledgementBrowserChecks.tokenWasHeader
+  || !acknowledgementBrowserChecks.splitSseClosed
+  || !acknowledgementBrowserChecks.oversizedRejected) {
+  throw new Error(`browser acknowledgement checks failed: ${JSON.stringify(acknowledgementBrowserChecks)}`);
 }
 await cdp('ServiceWorker.enable');
 await evaluate(`navigator.serviceWorker.register('/sw.js', { type: 'module' }).then(() => navigator.serviceWorker.ready)`);
@@ -967,6 +1069,7 @@ console.log(JSON.stringify({
   deviceTokenDigestStored: storedDeviceTokenDigest.length === 1 && storedDeviceTokenDigest[0][0] === expectedDeviceTokenDigest,
   deviceRemoval: removedDevice.body.devices.length,
   serviceWorkerPayloadValidation: payloadValidation,
+  acknowledgementBrowserChecks,
   notificationDisplay: displayedPush,
   malformedPushFallback: fallbackPush,
   addPasskey: addSecondResult.count,

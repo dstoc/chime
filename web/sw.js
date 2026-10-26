@@ -28,8 +28,10 @@ self.addEventListener("push", (event) => {
 });
 
 self.addEventListener("notificationclick", (event) => {
-  const opening = openNotificationUrl(event.notification, (url) => self.clients.openWindow(url));
-  if (opening) event.waitUntil(opening);
+  event.waitUntil(handleNotificationClick(
+    event.notification,
+    (url) => self.clients.openWindow(url),
+  ));
 });
 
 export function openNotificationUrl(notification, openWindow) {
@@ -37,6 +39,33 @@ export function openNotificationUrl(notification, openWindow) {
   notification.close();
   if (typeof url === "string" && validHttpsUrl(url)) return openWindow(url);
   return null;
+}
+
+export function handleNotificationClick(notification, openWindow, acknowledge = acknowledgeNotification) {
+  const opening = openNotificationUrl(notification, openWindow);
+  const acknowledgement = acknowledge(notification.data);
+  return Promise.allSettled([opening, acknowledgement]);
+}
+
+export async function acknowledgeNotification(data) {
+  if (!data || !/^[A-Za-z0-9_-]{22}$/.test(data.id || "")
+      || !/^[A-Za-z0-9_-]{43}$/.test(data.ack_capability || "")) return;
+  try {
+    const credentials = await getDeviceCredentials();
+    if (!credentials?.token) return;
+    await fetch("/api/device/ack", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${credentials.token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ id: data.id, capability: data.ack_capability }),
+      cache: "no-store",
+      credentials: "same-origin",
+    });
+  } catch {
+    // A click always closes locally. Failed acknowledgements are not queued.
+  }
 }
 
 export async function displayPayload(registration, payload, deviceId = null) {
