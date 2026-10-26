@@ -1,0 +1,20 @@
+[Unit]
+Description=Chime notification server
+
+[Container]
+Image=chime.build
+ContainerName=chime-server
+Pod=chime.pod
+StartWithPod=true
+User=10001:10001
+ReadOnly=true
+ReadOnlyTmpfs=true
+Exec=--origin https://chime.example-tailnet.ts.net --data-dir /var/lib/chime
+Volume=%h/.local/share/chime/data:/var/lib/chime:rw,Z
+StopTimeout=30
+
+[Service]
+Restart=always
+
+[Install]
+WantedBy=default.target

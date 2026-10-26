@@ -9,6 +9,16 @@ cargo test --workspace --locked
 cargo build --workspace --bins --locked
 ```
 
+## Container and Quadlet checks
+
+The required `test` workflow checks the deployment files with Python's standard library and builds the root `Containerfile` from a clean checkout. Run the configuration check locally with:
+
+```sh
+python3 -m unittest discover --start-directory tests/deployment --pattern 'test_*.py'
+```
+
+Where rootless Podman is available, build the image with `podman build --tag localhost/chime:0.1.0 .` and follow the [operator guide](operator-guide.md) to validate the Quadlet units. The static check does not validate Podman Quadlet parsing, rootless runtime permissions, SELinux labels, a reboot, or a real tailnet connection.
+
 ## Local passkey browser check
 
 The browser check exercises setup, passkey administration, send-key controls, device enrollment and removal, browser IndexedDB token storage, and service-worker payload validation and text display against a temporary Chime data directory. It starts the server, a local HTTPS proxy, Chromium, and a WebAuthn virtual authenticator. It uses no npm packages.

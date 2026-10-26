@@ -79,6 +79,10 @@ The command requires the exclusive data-directory lock and refuses to run while 
 
 Chime creates the data directory and image directory with private permissions on Unix systems. SQLite stores the persistent VAPID key pair, send-key digests, device subscriptions and token digests, and image expiry metadata. The `images` subdirectory holds uploaded files until they expire. Include both SQLite and `images` when backing up Chime, and protect both as sensitive data. SQLite uses forward schema migrations. The server holds an exclusive data-directory lock for its lifetime, and `reset-admin` must acquire the same lock. Chime keeps no notification history.
 
+## Rootless Podman deployment
+
+The repository includes a rootless systemd Quadlet example with Tailscale Serve. It keeps Chime on its loopback listener and publishes no host ports. See the [operator guide](docs/operator-guide.md) for installation, first-use setup, updates, reset, backup, and troubleshooting.
+
 ## Development checks
 
 Run the checks used by the required GitHub `test` workflow:
