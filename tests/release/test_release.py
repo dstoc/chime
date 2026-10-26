@@ -338,21 +338,21 @@ case "$1" in
     shift
     origin=""
     data_dir=""
-    volume=""
+    state_tmpfs=""
     image_found=false
     previous=""
     for argument in "$@"; do
       case "$previous" in
         --origin) origin=$argument ;;
         --data-dir) data_dir=$argument ;;
-        --volume) volume=$argument ;;
+        --tmpfs) [[ "$argument" == /var/lib/chime:* ]] && state_tmpfs=$argument ;;
       esac
       [[ "$argument" == "ghcr.io/dstoc/chime@$IMAGE_DIGEST" ]] && image_found=true
       previous=$argument
     done
     [[ "$origin" == "$EXPECTED_ORIGIN" ]]
     [[ "$data_dir" == /var/lib/chime ]]
-    [[ "$volume" == *:/var/lib/chime:rw ]]
+    [[ "$state_tmpfs" == /var/lib/chime:rw,noexec,nosuid,size=64m,uid=10001,gid=10001,mode=0700 ]]
     [[ "$image_found" == true ]]
     ;;
   *) exit 90 ;;
