@@ -568,16 +568,61 @@ mod tests {
     };
     use crate::images::ImageStore;
     use crate::notify::NotifyState;
-    use crate::push::WebPushTransport;
+    use crate::push::{ProviderResult, PushTransport, WebPushTransport};
     use crate::{config::Origin, store::Store};
-    use axum::{body::Body, http::Request};
+    use async_trait::async_trait;
+    use axum::{
+        body::{Body, to_bytes},
+        http::Request,
+    };
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    use p256::{SecretKey, elliptic_curve::Generate};
     use sha2::{Digest, Sha256};
-    use std::str::FromStr;
     use std::sync::Arc;
+    use std::{
+        str::FromStr,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+    use tokio::sync::Mutex;
     use tower::ServiceExt;
+    use web_push::WebPushMessage;
+
+    #[derive(Default)]
+    struct RecordingTransport {
+        endpoints: Mutex<Vec<String>>,
+        requests_with_payload: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl PushTransport for RecordingTransport {
+        async fn send(&self, message: WebPushMessage) -> ProviderResult {
+            self.endpoints
+                .lock()
+                .await
+                .push(message.endpoint.to_string());
+            if message.payload.is_some() {
+                self.requests_with_payload.fetch_add(1, Ordering::Relaxed);
+                ProviderResult::Accepted
+            } else {
+                ProviderResult::Failed
+            }
+        }
+    }
 
     async fn app() -> (
+        axum::Router,
+        tempfile::TempDir,
+        String,
+        String,
+        ImageStore,
+        Store,
+    ) {
+        app_with_transport(Arc::new(WebPushTransport::new().unwrap())).await
+    }
+
+    async fn app_with_transport(
+        transport: Arc<dyn PushTransport>,
+    ) -> (
         axum::Router,
         tempfile::TempDir,
         String,
@@ -607,7 +652,7 @@ mod tests {
         (
             router(
                 AdminState::new(store.clone(), &origin).unwrap(),
-                NotifyState::new(store.clone(), Arc::new(WebPushTransport::new().unwrap())),
+                NotifyState::new(store.clone(), transport),
                 images.clone(),
             ),
             directory,
@@ -1174,6 +1219,119 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn json_and_multipart_notifications_reach_active_device() {
+        let transport = Arc::new(RecordingTransport::default());
+        let (app, _directory, _code, secret, _images, store) =
+            app_with_transport(transport.clone()).await;
+        let endpoint = "https://fcm.googleapis.com/fcm/send/test";
+        let key = SecretKey::try_generate().unwrap();
+        let p256dh = URL_SAFE_NO_PAD.encode(key.public_key().to_sec1_bytes());
+        let auth = URL_SAFE_NO_PAD.encode([4_u8; 16]);
+        store
+            .database()
+            .run(move |connection| {
+                connection.execute(
+                    "INSERT INTO receiving_devices
+                     (id, name, endpoint, p256dh, auth, token_digest,
+                      created_at, updated_at, revision)
+                     VALUES ('BBBBBBBBBBBBBBBBBBBBBB', 'test device', ?1, ?2, ?3,
+                       zeroblob(32), unixepoch(), unixepoch(), 1)",
+                    rusqlite::params![endpoint, p256dh, auth],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let json = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/notify")
+                    .header("authorization", format!("Bearer {secret}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"title":"JSON delivery","image_url":"https://images.example/build.png","url":"https://example.com/result"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(json.status(), StatusCode::OK);
+        let json_summary = to_bytes(json.into_body(), MAX_JSON_BODY_BYTES)
+            .await
+            .unwrap();
+        let json_summary: serde_json::Value = serde_json::from_slice(&json_summary).unwrap();
+        assert_eq!(json_summary["attempted"], 1);
+        assert_eq!(json_summary["accepted"], 1);
+        assert_eq!(json_summary["outcome"], "accepted");
+
+        let boundary = "chime-live-recipient-boundary";
+        let png = b"\x89PNG\r\n\x1a\nsmall png";
+        let upload = multipart_body(
+            boundary,
+            &[("title", b"Multipart delivery")],
+            Some(("render.png", "image/png", png)),
+        );
+        let multipart = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/notify")
+                    .header("authorization", format!("Bearer {secret}"))
+                    .header(
+                        "content-type",
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(upload))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(multipart.status(), StatusCode::OK);
+        let multipart_summary = to_bytes(multipart.into_body(), MAX_JSON_BODY_BYTES)
+            .await
+            .unwrap();
+        let multipart_summary: serde_json::Value =
+            serde_json::from_slice(&multipart_summary).unwrap();
+        assert_eq!(multipart_summary["attempted"], 1);
+        assert_eq!(multipart_summary["accepted"], 1);
+        assert_eq!(multipart_summary["outcome"], "accepted");
+
+        assert_eq!(transport.requests_with_payload.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            transport.endpoints.lock().await.as_slice(),
+            &[endpoint, endpoint],
+        );
+        let capability = store
+            .database()
+            .run(|connection| {
+                connection.query_row("SELECT capability FROM uploaded_images", [], |row| {
+                    row.get::<_, String>(0)
+                })
+            })
+            .await
+            .unwrap();
+        let image = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/images/{capability}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(image.status(), StatusCode::OK);
+        assert_eq!(image.headers()["content-type"], "image/png");
+        assert_eq!(
+            to_bytes(image.into_body(), MAX_IMAGE_BYTES).await.unwrap(),
+            png.as_slice(),
+        );
     }
 
     #[tokio::test]
