@@ -290,6 +290,7 @@ try {
 
   async function deliverImagePush(id, imagePath) {
     const payload = {
+      type: 'notify',
       version: 1,
       id,
       title: 'Image notification',

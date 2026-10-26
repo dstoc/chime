@@ -12,7 +12,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use subtle::ConstantTimeEq;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
 use webauthn_rs::prelude::{AuthenticationResult, Passkey};
 
 const DATABASE_FILE: &str = "chime.sqlite3";
@@ -26,6 +26,8 @@ const MAX_RECEIVING_DEVICES: usize = 64;
 #[derive(Clone)]
 pub struct Store {
     database: Database,
+    // Serialize device-token checks with admin enrollment/removal and stream invalidation.
+    device_authority: Arc<AsyncMutex<()>>,
     // Loaded and checked here; later milestones consume the persistent identity for push delivery.
     #[allow(dead_code)]
     vapid: VapidIdentity,
@@ -56,6 +58,7 @@ impl Store {
                 lock: Arc::new(lock),
                 slots: Arc::new(Semaphore::new(DATABASE_CONCURRENCY)),
             },
+            device_authority: Arc::new(AsyncMutex::new(())),
             vapid,
         })
     }
@@ -102,6 +105,52 @@ impl Store {
                 Ok(Some(subscriptions))
             })
             .await
+    }
+
+    pub async fn subscriptions_by_ids(&self, ids: Vec<String>) -> Result<Vec<StoredSubscription>> {
+        self.database
+            .run(move |connection| {
+                let wanted: std::collections::HashSet<String> = ids.into_iter().collect();
+                Ok(read_subscriptions(connection)?
+                    .into_iter()
+                    .filter(|subscription| wanted.contains(&subscription.id))
+                    .collect())
+            })
+            .await
+    }
+
+    // The caller holds lock_device_authority through the authorized operation.
+    pub(crate) async fn authorize_device(&self, secret: String) -> Result<Option<String>> {
+        let Some(encoded) = secret.strip_prefix("chime_dt_") else {
+            return Ok(None);
+        };
+        let Ok(bytes) = URL_SAFE_NO_PAD.decode(encoded) else {
+            return Ok(None);
+        };
+        if bytes.len() != 32 || URL_SAFE_NO_PAD.encode(&bytes) != encoded {
+            return Ok(None);
+        }
+        let digest = Sha256::digest(secret.as_bytes()).to_vec();
+        self.database
+            .run(move |connection| {
+                let mut statement =
+                    connection.prepare("SELECT id, token_digest FROM receiving_devices")?;
+                let mut rows = statement.query([])?;
+                while let Some(row) = rows.next()? {
+                    let id: String = row.get(0)?;
+                    let stored: Vec<u8> = row.get(1)?;
+                    if stored.len() == digest.len() && bool::from(stored.as_slice().ct_eq(&digest))
+                    {
+                        return Ok(Some(id));
+                    }
+                }
+                Ok(None)
+            })
+            .await
+    }
+
+    pub(crate) async fn lock_device_authority(&self) -> OwnedMutexGuard<()> {
+        Arc::clone(&self.device_authority).lock_owned().await
     }
 
     pub async fn remove_expired_subscription(&self, id: String, revision: i64) -> Result<bool> {

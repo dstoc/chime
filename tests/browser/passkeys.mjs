@@ -438,7 +438,7 @@ if (clearedToken !== null) throw new Error('removed device token remained in Ind
 const payloadValidation = await evaluate(`(async () => {
   const { validatePayload } = await import('/sw.js');
   const valid = {
-    version: 1, id: 'AAAAAAAAAAAAAAAAAAAAAA', title: 'Build complete', body: 'All checks passed',
+    type: 'notify', version: 1, id: 'AAAAAAAAAAAAAAAAAAAAAA', title: 'Build complete', body: 'All checks passed',
     image_url: 'https://images.example.invalid/build.png', url: 'https://example.com/build',
     expires_at: Math.floor(Date.now() / 1000) + 3600, ack_capability: 'A'.repeat(43),
   };
@@ -452,8 +452,43 @@ const payloadValidation = await evaluate(`(async () => {
   let closeCount = 0;
   await worker.openNotificationUrl({ data: { url: valid.url }, close: () => { closeCount += 1; } }, async (url) => opened.push(url));
   await worker.openNotificationUrl({ data: { url: 'javascript:alert(1)' }, close: () => { closeCount += 1; } }, async (url) => opened.push(url));
+  let noUrlCloseCount = 0;
+  const noUrlOpened = await worker.openNotificationUrl({ data: {}, close: () => { noUrlCloseCount += 1; } }, async (url) => opened.push(url));
+  const tokens = await import('/device-token.js');
+  const deviceToken = 'chime_dt_' + 'A'.repeat(43);
+  await tokens.saveDeviceCredentials('fixture-device', deviceToken);
+  const originalFetch = window.fetch;
+  let acknowledgementRequest = null;
+  window.fetch = async (url, options) => {
+    acknowledgementRequest = { url: String(url), authorization: options.headers.Authorization, body: JSON.parse(options.body) };
+    return { ok: true, status: 204 };
+  };
+  await worker.acknowledgeNotification({ id: valid.id, ack_capability: valid.ack_capability });
+  window.fetch = originalFetch;
+  await tokens.clearDeviceCredentials();
+  const clickOrder = [];
+  let releaseAck;
+  let ackStarted = false;
+  let ackReleased = false;
+  const clickWork = worker.handleNotificationClick(
+    { data: { url: valid.url }, close: () => clickOrder.push('close') },
+    (url) => { clickOrder.push('open'); return Promise.resolve(url); },
+    () => {
+      ackStarted = true;
+      clickOrder.push('ack');
+      return new Promise(resolve => {
+        releaseAck = () => { ackReleased = true; resolve(); };
+      });
+    },
+  );
+  const openedImmediately = clickOrder.join(',') === 'close,open' && !ackStarted;
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const openedBeforeAckCompleted = clickOrder.includes('open') && ackStarted && !ackReleased;
+  releaseAck();
+  await clickWork;
   return {
     valid: validatePayload(valid),
+    dismissVariant: validatePayload({ type: 'dismiss', version: 1, id: valid.id, expires_at: valid.expires_at }),
     oldVersion: validatePayload({ ...valid, version: 2 }),
     expired: validatePayload({ ...valid, expires_at: 1 }),
     unsafeExtra: validatePayload({ ...valid, html: '<script>' }),
@@ -462,18 +497,165 @@ const payloadValidation = await evaluate(`(async () => {
     imageFallback: calls.length === 2 && calls[0].options.image === valid.image_url
       && calls[1].options.image === undefined && calls[1].options.body === valid.body,
     click: opened.length === 1 && opened[0] === valid.url && closeCount === 2,
+    openedImmediately,
+    openedBeforeAckCompleted,
+    noUrlClosedWithoutNavigation: noUrlOpened === null && noUrlCloseCount === 1 && opened.length === 1,
+    acknowledgementHeaderOnly: acknowledgementRequest?.url === '/api/device/ack'
+      && acknowledgementRequest.authorization === 'Bearer ' + deviceToken
+      && acknowledgementRequest.body.id === valid.id
+      && acknowledgementRequest.body.capability === valid.ack_capability,
   };
 })()`);
-if (!payloadValidation.valid || payloadValidation.oldVersion || payloadValidation.expired
+if (!payloadValidation.valid || !payloadValidation.dismissVariant || payloadValidation.oldVersion || payloadValidation.expired
   || payloadValidation.unsafeExtra || payloadValidation.unsafeImage || payloadValidation.unsafeClick
-  || !payloadValidation.imageFallback || !payloadValidation.click) {
+  || !payloadValidation.imageFallback || !payloadValidation.click || !payloadValidation.openedBeforeAckCompleted
+  || !payloadValidation.openedImmediately
+  || !payloadValidation.noUrlClosedWithoutNavigation || !payloadValidation.acknowledgementHeaderOnly) {
   throw new Error(`service-worker payload validation failed: ${JSON.stringify(payloadValidation)}`);
+}
+const dismissalBrowserChecks = await evaluate(`(async () => {
+  const worker = await import('/sw.js');
+  const tokens = await import('/device-token.js');
+  const now = Math.floor(Date.now() / 1000);
+  const expiresAt = now + 3600;
+  const notifyId = 'D'.repeat(22);
+  const notify = {
+    type: 'notify', version: 1, id: notifyId, title: 'Build complete', body: 'Ready',
+    image_url: null, url: null, expires_at: expiresAt, ack_capability: 'A'.repeat(43),
+  };
+  const dismissal = { type: 'dismiss', version: 1, id: notifyId, expires_at: expiresAt };
+  const visible = new Map();
+  let shownCount = 0;
+  const registration = {
+    showNotification: async (title, options) => {
+      shownCount += 1;
+      const notification = {
+        title,
+        data: { id: notifyId },
+        close: () => visible.delete(options.tag),
+      };
+      visible.set(options.tag, notification);
+    },
+    getNotifications: async ({ tag } = {}) => tag
+      ? [...visible.entries()].filter(([key]) => key === tag).map(([, value]) => value)
+      : [...visible.values()],
+  };
+
+  const arrivalOrder = await Promise.all([
+    worker.enqueuePush(() => worker.handlePushPayload(registration, notify)),
+    worker.enqueuePush(() => worker.handlePushPayload(registration, dismissal)),
+  ]);
+  const concurrentPairClosed = arrivalOrder.every(Boolean) && visible.size === 0;
+  const lateDelivery = await worker.enqueuePush(() => worker.handlePushPayload(registration, notify));
+  const lateNotifySuppressed = lateDelivery === false && shownCount === 1 && visible.size === 0;
+
+  const unmatchedId = 'U'.repeat(22);
+  let unmatchedShown = 0;
+  const unmatchedDismiss = await worker.enqueuePush(() => worker.handlePushPayload({
+    getNotifications: async () => [],
+    showNotification: async () => { unmatchedShown += 1; },
+  }, { type: 'dismiss', version: 1, id: unmatchedId, expires_at: expiresAt }));
+  const unmatchedIsNoOp = unmatchedDismiss && unmatchedShown === 0
+    && await tokens.isNotificationDismissed(unmatchedId);
+
+  let closedDespiteStorageFailure = false;
+  await worker.handlePushPayload({
+    getNotifications: async () => [{ close: () => { closedDespiteStorageFailure = true; } }],
+    showNotification: async () => { throw new Error('dismissal must not create a notification'); },
+  }, dismissal, async () => { throw new Error('IndexedDB unavailable'); });
+  let shownDespiteStorageFailure = 0;
+  const notifySurvivesStorageFailure = await worker.displayPayload({
+    showNotification: async () => { shownDespiteStorageFailure += 1; },
+  }, notify, async () => { throw new Error('IndexedDB unavailable'); });
+
+  const clickedId = 'C'.repeat(22);
+  const clickOrder = [];
+  let ackStarted = false;
+  let releaseAck;
+  const clickWork = worker.handleNotificationClick({
+    data: { id: clickedId, expires_at: expiresAt, ack_capability: 'B'.repeat(43), url: 'https://example.com/result' },
+    close: () => clickOrder.push('close'),
+  }, (url) => {
+    clickOrder.push('open');
+    return Promise.resolve(url);
+  }, () => {
+    ackStarted = true;
+    return new Promise(resolve => { releaseAck = resolve; });
+  });
+  const openedImmediately = clickOrder.join(',') === 'close,open' && !ackStarted;
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const openedBeforeAckCompleted = clickOrder.includes('open') && ackStarted;
+  releaseAck();
+  await clickWork;
+  const clickedMemory = await tokens.isNotificationDismissed(clickedId);
+  const clickedNotify = { ...notify, id: clickedId };
+  const clickedRedisplay = await worker.displayPayload(registration, clickedNotify);
+
+  const expiredId = 'E'.repeat(22);
+  await tokens.rememberDismissedNotification(expiredId, now + 2, now);
+  const expiredRecordRemoved = !(await tokens.isNotificationDismissed(expiredId, now + 2));
+
+  const database = await new Promise((resolve, reject) => {
+    const request = indexedDB.open('chime-device', 2);
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+  const seed = database.transaction('dismissed', 'readwrite');
+  const store = seed.objectStore('dismissed');
+  for (let index = 0; index < 4096; index += 1) {
+    store.put({ id: String(index).padStart(22, '0'), expires_at: expiresAt });
+  }
+  await new Promise((resolve, reject) => {
+    seed.oncomplete = resolve;
+    seed.onerror = () => reject(seed.error);
+    seed.onabort = () => reject(seed.error);
+  });
+  database.close();
+  await tokens.rememberDismissedNotification('Z'.repeat(22), expiresAt, now);
+  const boundedDatabase = await new Promise((resolve, reject) => {
+    const request = indexedDB.open('chime-device', 2);
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+  const storedCount = await new Promise((resolve, reject) => {
+    const request = boundedDatabase.transaction('dismissed').objectStore('dismissed').count();
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+  boundedDatabase.close();
+  const boundedSet = storedCount <= 4096;
+  await tokens.clearDeviceCredentials();
+  const removalClearedSet = !(await tokens.isNotificationDismissed(unmatchedId));
+
+  return {
+    concurrentPairClosed,
+    lateNotifySuppressed,
+    unmatchedIsNoOp,
+    closedDespiteStorageFailure,
+    notifySurvivesStorageFailure: notifySurvivesStorageFailure && shownDespiteStorageFailure === 1,
+    openedImmediately,
+    openedBeforeAckCompleted,
+    clickedMemory,
+    clickedRedisplay,
+    expiredRecordRemoved,
+    boundedSet,
+    removalClearedSet,
+  };
+})()`);
+if (!dismissalBrowserChecks.concurrentPairClosed || !dismissalBrowserChecks.lateNotifySuppressed
+  || !dismissalBrowserChecks.unmatchedIsNoOp || !dismissalBrowserChecks.closedDespiteStorageFailure
+  || !dismissalBrowserChecks.notifySurvivesStorageFailure || !dismissalBrowserChecks.openedImmediately
+  || !dismissalBrowserChecks.openedBeforeAckCompleted || !dismissalBrowserChecks.clickedMemory
+  || dismissalBrowserChecks.clickedRedisplay !== false || !dismissalBrowserChecks.expiredRecordRemoved
+  || !dismissalBrowserChecks.boundedSet || !dismissalBrowserChecks.removalClearedSet) {
+  throw new Error(`browser dismissal checks failed: ${JSON.stringify(dismissalBrowserChecks)}`);
 }
 await cdp('ServiceWorker.enable');
 await evaluate(`navigator.serviceWorker.register('/sw.js', { type: 'module' }).then(() => navigator.serviceWorker.ready)`);
 for (let attempt = 0; attempt < 100 && !serviceWorkerRegistrationId; attempt += 1) await sleep(50);
 if (!serviceWorkerRegistrationId) throw new Error('service worker did not register with Chromium');
 const validPushPayload = {
+  type: 'notify',
   version: 1,
   id: 'AAAAAAAAAAAAAAAAAAAAAA',
   title: 'Build complete',
@@ -503,6 +685,38 @@ if (displayedPush.length !== 1 || displayedPush[0].title !== 'Build complete'
   || displayedPush[0].data.url !== validPushPayload.url) {
   throw new Error(`valid push was not displayed as text: ${JSON.stringify(displayedPush)}`);
 }
+const dismissPushPayload = {
+  type: 'dismiss',
+  version: 1,
+  id: validPushPayload.id,
+  expires_at: validPushPayload.expires_at,
+};
+await cdp('ServiceWorker.deliverPushMessage', {
+  origin,
+  registrationId: serviceWorkerRegistrationId,
+  data: JSON.stringify(dismissPushPayload),
+});
+const dismissedPush = await evaluate(`(async () => {
+  const registration = await navigator.serviceWorker.ready;
+  for (let attempt = 0; attempt < 60; attempt += 1) {
+    const notifications = await registration.getNotifications({ tag: 'chime-AAAAAAAAAAAAAAAAAAAAAA' });
+    if (notifications.length === 0) return true;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  return false;
+})()`);
+if (!dismissedPush) throw new Error('dismissal push did not close the matching notification');
+await cdp('ServiceWorker.deliverPushMessage', {
+  origin,
+  registrationId: serviceWorkerRegistrationId,
+  data: JSON.stringify(validPushPayload),
+});
+const delayedPushStayedClosed = await evaluate(`(async () => {
+  const registration = await navigator.serviceWorker.ready;
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  return (await registration.getNotifications({ tag: 'chime-AAAAAAAAAAAAAAAAAAAAAA' })).length === 0;
+})()`);
+if (!delayedPushStayedClosed) throw new Error('delayed notification push reappeared after dismissal');
 const invalidPushPayload = { ...validPushPayload, id: 'BBBBBBBBBBBBBBBBBBBBBB', version: 2 };
 await cdp('ServiceWorker.deliverPushMessage', {
   origin,
@@ -967,7 +1181,10 @@ console.log(JSON.stringify({
   deviceTokenDigestStored: storedDeviceTokenDigest.length === 1 && storedDeviceTokenDigest[0][0] === expectedDeviceTokenDigest,
   deviceRemoval: removedDevice.body.devices.length,
   serviceWorkerPayloadValidation: payloadValidation,
+  dismissalBrowserChecks,
   notificationDisplay: displayedPush,
+  dismissalPush: dismissedPush,
+  delayedPushStayedClosed,
   malformedPushFallback: fallbackPush,
   addPasskey: addSecondResult.count,
   addCancellation: 'passed with input preserved',

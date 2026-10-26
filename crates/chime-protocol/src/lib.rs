@@ -12,18 +12,25 @@ pub struct NotificationRequest {
     pub url: Option<String>,
 }
 
-/// Versioned push payload shown by the browser service worker.
+/// A versioned push payload handled by the browser service worker.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct NotificationPayload {
-    pub version: u8,
-    pub id: String,
-    pub title: String,
-    pub body: Option<String>,
-    pub image_url: Option<String>,
-    pub url: Option<String>,
-    pub expires_at: i64,
-    pub ack_capability: String,
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PushPayload {
+    Notify {
+        version: u8,
+        id: String,
+        title: String,
+        body: Option<String>,
+        image_url: Option<String>,
+        url: Option<String>,
+        expires_at: i64,
+        ack_capability: String,
+    },
+    Dismiss {
+        version: u8,
+        id: String,
+        expires_at: i64,
+    },
 }
 
 /// The outcome of attempting to deliver one notification.
@@ -50,7 +57,7 @@ pub struct DeliverySummary {
 
 #[cfg(test)]
 mod tests {
-    use super::{DeliveryOutcome, DeliverySummary, NotificationRequest};
+    use super::{DeliveryOutcome, DeliverySummary, NotificationRequest, PushPayload};
 
     #[test]
     fn notification_request_uses_the_proposal_json_fields() {
@@ -94,5 +101,34 @@ mod tests {
         let json = serde_json::to_value(summary).unwrap();
         assert_eq!(json["outcome"], "accepted");
         assert_eq!(json["expired_subscriptions_removed"], 0);
+    }
+
+    #[test]
+    fn push_payloads_have_explicit_versioned_variants() {
+        let notify = PushPayload::Notify {
+            version: 1,
+            id: "A".repeat(22),
+            title: "Build complete".into(),
+            body: None,
+            image_url: None,
+            url: None,
+            expires_at: 1_800_000_000,
+            ack_capability: "B".repeat(43),
+        };
+        let dismiss = PushPayload::Dismiss {
+            version: 1,
+            id: "A".repeat(22),
+            expires_at: 1_800_000_000,
+        };
+
+        let notify = serde_json::to_value(notify).unwrap();
+        let dismiss = serde_json::to_value(dismiss).unwrap();
+        assert_eq!(notify["type"], "notify");
+        assert_eq!(notify["version"], 1);
+        assert_eq!(dismiss["type"], "dismiss");
+        assert_eq!(dismiss["version"], 1);
+        assert!(!dismiss.as_object().unwrap().contains_key("title"));
+        assert!(serde_json::from_value::<PushPayload>(dismiss).is_ok());
+        assert!(serde_json::from_str::<PushPayload>(r#"{"type":"unknown","version":1}"#).is_err());
     }
 }

@@ -2,6 +2,8 @@
 
 Chime sends short notifications from a command line or web application to browsers that you enroll. Notifications can include an image and an HTTPS link to open when clicked. Administrators use passkeys to manage receiving devices and independently revocable send keys. Chime does not keep a notification history.
 
+Cross-device dismissal uses best-effort background pushes. Browser delivery can delay or miss them, and Chrome may show a generic background-update notification. See the [cross-device dismissal design](docs/proposals/chime-cross-device-dismissal.md).
+
 ## Run the server
 
 The server requires its public HTTPS origin and a private data directory. It listens on `127.0.0.1:8080` for a local HTTPS proxy.
@@ -58,6 +60,12 @@ The send API accepts JSON fields `title`, `body`, `image_url`, and `url`, or mul
 Cross-origin browser sends are allowed on `/api/notify` only. The endpoint accepts the send key in an `Authorization` header and does not allow credentialed CORS. Browser local-network permission controls can still block or prompt for access to a tailnet server. Test those controls on the target browser and network.
 
 The CLI also reads `CHIME_URL` and `CHIME_API_KEY`; environment values override the config file. Use `--config PATH` or `CHIME_CONFIG` to select a different file. The CLI reports push-provider acceptance, not device receipt, and exits with a nonzero status for partial failure, total failure, or no devices.
+
+Clicking a notification closes it on that device and opens its validated HTTPS link immediately. The service worker acknowledges the click with its device token and notification capability. Chime then attempts an encrypted dismissal push to other original recipients that remain enrolled. The acknowledgement confirms Chime accepted the request; it does not confirm that another device removed its OS notification.
+
+A matching dismissal closes notifications with the same tag, even when no Chime page is open. A valid dismissal with no matching notification does not show a new notification. The dismissal push TTL is the original notification's remaining lifetime. It limits provider retention; it does not expire a notification already displayed by the operating system. Acknowledgement records contain no notification content and live only in bounded server memory. A restart or eviction can lose an acknowledgement before fan-out, and failed or offline pushes are not retried. Expired or evicted local dismissal memory can allow a delayed notification to reappear. Chime keeps no offline acknowledgement queue.
+
+Chime does not send background-dismissal pushes to Apple push endpoints pending separate Safari verification. Ordinary push delivery and background dismissal have separate browser compatibility results.
 
 The browser provides send-key creation and revocation, device enrollment and removal, and administrator passkey management. Enrollment accepts HTTPS push endpoints from Google FCM, Mozilla Push, and Apple Web Push. Other providers are rejected. Chime limits titles to 200 UTF-8 bytes, bodies to 1,500 bytes, and URLs to 2,048 bytes. JSON requests are limited to 16 KiB; multipart uploads are limited to 5 MiB plus 16 KiB of overhead. Chime supports up to 64 receiving devices, keeps provider messages for one hour, and limits the server to 60 sends per minute, four sends at once, and eight provider requests at once.
 
