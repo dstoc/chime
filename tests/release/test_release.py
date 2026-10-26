@@ -209,6 +209,21 @@ class ReleaseConfigurationTests(unittest.TestCase):
                 self.assertEqual(bundle.getmember("LICENSE").mode, 0o644)
 
 
+    def test_image_smoke_state_is_private_and_writable_by_container_user(self) -> None:
+        script = workflow_run_script("Verify anonymous AMD64 pull and server response")
+
+        # The image runs as UID/GID 10001 and chmods its state directory to 0700.
+        # A host-owned bind mount (even mode 0777) cannot be chmodded by that user.
+        self.assertIn(
+            "--tmpfs /var/lib/chime:rw,noexec,nosuid,size=64m,uid=10001,gid=10001,mode=0700",
+            script,
+        )
+        self.assertNotIn('state_dir=$(mktemp -d)', script)
+        self.assertNotIn('--volume "$state_dir:/var/lib/chime:rw"', script)
+        self.assertIn("--read-only", script)
+        self.assertIn("--network host", script)
+        self.assertIn('curl --fail --silent http://127.0.0.1:8080/', script)
+
     def test_cli_runtime_gate_extracts_and_runs_the_archive_binary(self) -> None:
         version = "0.2.0"
         archive_name = f"chime-v{version}-x86_64-unknown-linux-gnu.tar.gz"
