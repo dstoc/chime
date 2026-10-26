@@ -30,6 +30,14 @@ self.addEventListener("notificationclick", (event) => {
   ));
 });
 
+self.addEventListener("notificationclose", (event) => {
+  event.waitUntil(handleNotificationDismissal(
+    event.notification,
+    acknowledgeNotification,
+    self.registration,
+  ));
+});
+
 export function enqueuePush(work) {
   const result = pushQueue.then(work);
   pushQueue = result.catch(() => {});
@@ -61,10 +69,20 @@ export function handleNotificationClick(
   registration = self.registration,
 ) {
   const opening = openNotificationUrl(notification, openWindow);
+  const dismissal = handleNotificationDismissal(notification, acknowledge, registration);
+  return Promise.allSettled([opening, dismissal]);
+}
+
+export function handleNotificationDismissal(
+  notification,
+  acknowledge = acknowledgeNotification,
+  registration = self.registration,
+  rememberDismissed = rememberDismissedNotification,
+) {
   const data = notification.data ?? {};
   const localWork = enqueuePush(async () => {
     try {
-      await rememberDismissedNotification(data.id, data.expires_at);
+      await rememberDismissed(data.id, data.expires_at);
     } catch {
       // Local dismissal must still close a notification if IndexedDB is unavailable.
     }
@@ -72,8 +90,11 @@ export function handleNotificationClick(
     const notifications = await registration.getNotifications({ tag: `chime-${data.id}` });
     for (const item of notifications) item.close();
   });
-  const acknowledgement = Promise.resolve().then(() => acknowledge(data));
-  return Promise.allSettled([opening, localWork, acknowledgement]);
+  const hasAcknowledgementData = validId(data.id) && validCapability(data.ack_capability);
+  const acknowledgement = hasAcknowledgementData
+    ? Promise.resolve().then(() => acknowledge(data))
+    : Promise.resolve();
+  return Promise.allSettled([localWork, acknowledgement]);
 }
 
 export async function acknowledgeNotification(data) {
