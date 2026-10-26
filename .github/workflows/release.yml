@@ -449,12 +449,9 @@ jobs:
           grep -Fxq "ghcr.io/dstoc/chime@$IMAGE_DIGEST" <<< "$repo_digests"
           image_by_digest="ghcr.io/dstoc/chime@$IMAGE_DIGEST"
 
-          state_dir=$(mktemp -d)
-          chmod 0777 "$state_dir"
           container_name="chime-release-smoke-${GITHUB_RUN_ID}"
           cleanup() {
             docker rm --force "$container_name" >/dev/null 2>&1 || true
-            rm -rf "$state_dir"
           }
           trap cleanup EXIT
           docker run --detach --rm \
@@ -462,7 +459,7 @@ jobs:
             --network host \
             --read-only \
             --tmpfs /tmp:rw,noexec,nosuid,size=16m \
-            --volume "$state_dir:/var/lib/chime:rw" \
+            --tmpfs /var/lib/chime:rw,noexec,nosuid,size=64m,uid=10001,gid=10001,mode=0700 \
             "$image_by_digest" \
             --origin https://chime.example-tailnet.ts.net \
             --data-dir /var/lib/chime >/dev/null

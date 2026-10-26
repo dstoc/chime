@@ -209,6 +209,21 @@ class ReleaseConfigurationTests(unittest.TestCase):
                 self.assertEqual(bundle.getmember("LICENSE").mode, 0o644)
 
 
+    def test_image_smoke_state_is_private_and_writable_by_container_user(self) -> None:
+        script = workflow_run_script("Verify anonymous AMD64 pull and server response")
+
+        # The image runs as UID/GID 10001 and chmods its state directory to 0700.
+        # A host-owned bind mount (even mode 0777) cannot be chmodded by that user.
+        self.assertIn(
+            "--tmpfs /var/lib/chime:rw,noexec,nosuid,size=64m,uid=10001,gid=10001,mode=0700",
+            script,
+        )
+        self.assertNotIn('state_dir=$(mktemp -d)', script)
+        self.assertNotIn('--volume "$state_dir:/var/lib/chime:rw"', script)
+        self.assertIn("--read-only", script)
+        self.assertIn("--network host", script)
+        self.assertIn('curl --fail --silent http://127.0.0.1:8080/', script)
+
     def test_cli_runtime_gate_extracts_and_runs_the_archive_binary(self) -> None:
         version = "0.2.0"
         archive_name = f"chime-v{version}-x86_64-unknown-linux-gnu.tar.gz"
@@ -323,21 +338,21 @@ case "$1" in
     shift
     origin=""
     data_dir=""
-    volume=""
+    state_tmpfs=""
     image_found=false
     previous=""
     for argument in "$@"; do
       case "$previous" in
         --origin) origin=$argument ;;
         --data-dir) data_dir=$argument ;;
-        --volume) volume=$argument ;;
+        --tmpfs) [[ "$argument" == /var/lib/chime:* ]] && state_tmpfs=$argument ;;
       esac
       [[ "$argument" == "ghcr.io/dstoc/chime@$IMAGE_DIGEST" ]] && image_found=true
       previous=$argument
     done
     [[ "$origin" == "$EXPECTED_ORIGIN" ]]
     [[ "$data_dir" == /var/lib/chime ]]
-    [[ "$volume" == *:/var/lib/chime:rw ]]
+    [[ "$state_tmpfs" == /var/lib/chime:rw,noexec,nosuid,size=64m,uid=10001,gid=10001,mode=0700 ]]
     [[ "$image_found" == true ]]
     ;;
   *) exit 90 ;;
