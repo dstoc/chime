@@ -22,4 +22,14 @@ node tests/browser/passkeys.mjs
 
 The script checks invalid and valid setup codes, registration and authentication with required user verification, passkey list/add/remove flows, cancellation, last-passkey protection, wrong challenge/origin/RP ID/user-verification assertions, and one-use completion. It loads the standalone display mode and icon metadata from the manifest under the production CSP. It creates and revokes independent send keys through the browser UI, checks the no-device and revoked-key API responses, and verifies that SQLite and server logs contain only send-key digests. It enrolls through the Enable notifications form with a local push fixture, checks the submitted device name and IndexedDB token, then rotates an enrollment token for the same endpoint and verifies its SQLite digest and IndexedDB value before removal. It injects valid and malformed local push events and checks the notification text and safe fallback. It submits valid assertion and registration completions after expiry, removes authorizers before both completion stages, and races duplicate valid mutation completions. Expiry coverage waits just over two minutes. The script keeps the generated setup code in memory and removes its temporary data when it exits. Set `CHROMIUM_PATH` if Chromium is not at `/usr/bin/chromium`.
 
-This check uses a virtual authenticator and a temporary self-signed certificate. Its push endpoint is a local fixture; it does not send through a provider. Rust notification tests use a fake transport after the same production endpoint and key validation. These checks do not verify physical passkeys, production TLS, tailnet access, real push-provider delivery, iOS Home Screen behavior, or another browser's behavior. Those checks still require acceptance on target devices and deployment.
+This check uses a virtual authenticator and a temporary self-signed certificate. Its push endpoint is a local fixture; it does not send through a provider. The service-worker checks cover image options, click URL validation, text display, and a text fallback when image display fails. Rust notification tests use a fake transport after the same production endpoint and key validation. These checks do not verify physical passkeys, production TLS, tailnet access, real push-provider delivery, iOS Home Screen behavior, or another browser's behavior. Those checks still require acceptance on target devices and deployment.
+
+## Cross-origin send check
+
+Run the distinct-origin browser check with Chromium:
+
+```sh
+node tests/browser/notify-cors.mjs
+```
+
+The script starts Chime behind a local HTTPS proxy and opens a page at a different HTTPS origin. It exercises the browser-generated preflight and Bearer send, reads an invalid-key 401 response, and confirms that setup and admin requests remain unreadable cross-origin. Both test origins use loopback, so this does not exercise Chrome's local-network permission behavior for a tailnet destination. Verify that permission flow on the target Chrome setup. The virtual browser test does not establish physical-device or push-provider delivery.

@@ -439,16 +439,34 @@ const payloadValidation = await evaluate(`(async () => {
   const { validatePayload } = await import('/sw.js');
   const valid = {
     version: 1, id: 'AAAAAAAAAAAAAAAAAAAAAA', title: 'Build complete', body: 'All checks passed',
+    image_url: 'https://images.example.invalid/build.png', url: 'https://example.com/build',
     expires_at: Math.floor(Date.now() / 1000) + 3600, ack_capability: 'A'.repeat(43),
   };
+  const calls = [];
+  const worker = await import('/sw.js');
+  await worker.displayPayload({ showNotification: async (title, options) => {
+    calls.push({ title, options: structuredClone(options) });
+    if (calls.length === 1) throw new Error('image display failed');
+  } }, valid);
+  const opened = [];
+  let closeCount = 0;
+  await worker.openNotificationUrl({ data: { url: valid.url }, close: () => { closeCount += 1; } }, async (url) => opened.push(url));
+  await worker.openNotificationUrl({ data: { url: 'javascript:alert(1)' }, close: () => { closeCount += 1; } }, async (url) => opened.push(url));
   return {
     valid: validatePayload(valid),
     oldVersion: validatePayload({ ...valid, version: 2 }),
     expired: validatePayload({ ...valid, expires_at: 1 }),
     unsafeExtra: validatePayload({ ...valid, html: '<script>' }),
+    unsafeImage: validatePayload({ ...valid, image_url: 'javascript:alert(1)' }),
+    unsafeClick: validatePayload({ ...valid, url: 'https://user:pass@example.com/' }),
+    imageFallback: calls.length === 2 && calls[0].options.image === valid.image_url
+      && calls[1].options.image === undefined && calls[1].options.body === valid.body,
+    click: opened.length === 1 && opened[0] === valid.url && closeCount === 2,
   };
 })()`);
-if (!payloadValidation.valid || payloadValidation.oldVersion || payloadValidation.expired || payloadValidation.unsafeExtra) {
+if (!payloadValidation.valid || payloadValidation.oldVersion || payloadValidation.expired
+  || payloadValidation.unsafeExtra || payloadValidation.unsafeImage || payloadValidation.unsafeClick
+  || !payloadValidation.imageFallback || !payloadValidation.click) {
   throw new Error(`service-worker payload validation failed: ${JSON.stringify(payloadValidation)}`);
 }
 await cdp('ServiceWorker.enable');
@@ -460,6 +478,8 @@ const validPushPayload = {
   id: 'AAAAAAAAAAAAAAAAAAAAAA',
   title: 'Build complete',
   body: 'All checks passed',
+  image_url: `${origin}/api/images/${'A'.repeat(43)}`,
+  url: 'https://example.com/build',
   expires_at: Math.floor(Date.now() / 1000) + 3600,
   ack_capability: 'A'.repeat(43),
 };
@@ -472,12 +492,15 @@ const displayedPush = await evaluate(`(async () => {
   const registration = await navigator.serviceWorker.ready;
   for (let attempt = 0; attempt < 60; attempt += 1) {
     const notifications = await registration.getNotifications({ tag: 'chime-AAAAAAAAAAAAAAAAAAAAAA' });
-    if (notifications.length) return notifications.map((item) => ({ title: item.title, body: item.body, data: item.data }));
+    if (notifications.length) return notifications.map((item) => ({ title: item.title, body: item.body, image: item.image, data: item.data }));
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
   return [];
 })()`);
-if (displayedPush.length !== 1 || displayedPush[0].title !== 'Build complete' || displayedPush[0].body !== 'All checks passed') {
+if (displayedPush.length !== 1 || displayedPush[0].title !== 'Build complete'
+  || displayedPush[0].body !== 'All checks passed'
+  || displayedPush[0].image !== validPushPayload.image_url
+  || displayedPush[0].data.url !== validPushPayload.url) {
   throw new Error(`valid push was not displayed as text: ${JSON.stringify(displayedPush)}`);
 }
 const invalidPushPayload = { ...validPushPayload, id: 'BBBBBBBBBBBBBBBBBBBBBB', version: 2 };

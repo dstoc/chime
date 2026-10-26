@@ -2,6 +2,7 @@ mod admin;
 mod config;
 mod data_dir;
 mod devices;
+mod images;
 mod notify;
 mod push;
 mod store;
@@ -47,6 +48,22 @@ async fn main() -> Result<()> {
 
     let config = Config::checked(Args::parse())?;
     let store = Store::open(&config.data_dir).context("initialize Chime state")?;
+    let images = images::ImageStore::new(store.clone()).context("initialize image storage")?;
+    images
+        .cleanup_startup()
+        .await
+        .context("clean expired images")?;
+    let cleanup_images = images.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5 * 60));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            if let Err(error) = cleanup_images.cleanup_expired().await {
+                eprintln!("image cleanup failed: {error:#}");
+            }
+        }
+    });
     if let Some(code) = store.initialize_setup_code().await? {
         eprintln!("First-use setup code (sensitive; save it now): {code}");
     }
@@ -66,7 +83,7 @@ async fn main() -> Result<()> {
         config.origin.as_str()
     );
 
-    serve(listener, web::router(admin_state, notify_state))
+    serve(listener, web::router(admin_state, notify_state, images))
         .with_graceful_shutdown(shutdown_signal())
         .await
         .context("serve HTTP requests")

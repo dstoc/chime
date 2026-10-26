@@ -18,10 +18,11 @@ use std::{
 };
 use subtle::ConstantTimeEq;
 use tokio::{
-    sync::{Mutex, Semaphore},
+    sync::{Mutex, OwnedSemaphorePermit, Semaphore},
     task::JoinSet,
     time::timeout,
 };
+use url::Url;
 use web_push::{
     ContentEncoding, SubscriptionInfo, Urgency, VapidSignatureBuilder, WebPushMessage,
     WebPushMessageBuilder,
@@ -73,6 +74,24 @@ pub struct NotifyError {
     pub message: &'static str,
 }
 
+pub struct AuthorizedSend {
+    subscriptions: Vec<StoredSubscription>,
+    _send_slot: OwnedSemaphorePermit,
+}
+
+pub enum SendPlan {
+    NoDevices(DeliverySummary),
+    Ready(PreparedSend),
+}
+
+pub struct PreparedSend {
+    id: String,
+    ack_capability: String,
+    total_recipients: u32,
+    messages: Vec<(StoredSubscription, WebPushMessage)>,
+    _send_slot: OwnedSemaphorePermit,
+}
+
 impl NotifyState {
     pub fn new(store: Store, transport: Arc<dyn PushTransport>) -> Self {
         Self(Arc::new(NotifyInner {
@@ -89,12 +108,7 @@ impl NotifyState {
         }))
     }
 
-    pub async fn send(
-        &self,
-        secret: String,
-        request: NotificationRequest,
-    ) -> Result<DeliverySummary, NotifyError> {
-        validate_request(&request)?;
+    pub async fn authorize(&self, secret: String) -> Result<AuthorizedSend, NotifyError> {
         let subscriptions = self
             .0
             .store
@@ -103,7 +117,24 @@ impl NotifyState {
             .map_err(|_| internal_error())?
             .ok_or_else(unauthorized)?;
         self.check_send_budget().await?;
+        let send_slot = self
+            .0
+            .send_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| capacity_error())?;
+        Ok(AuthorizedSend {
+            subscriptions,
+            _send_slot: send_slot,
+        })
+    }
 
+    pub fn prepare(
+        &self,
+        authorized: AuthorizedSend,
+        request: NotificationRequest,
+    ) -> Result<SendPlan, NotifyError> {
+        validate_request(&request)?;
         let id = random_token(16)?;
         let ack_capability = random_token(32)?;
         let expires_at = unix_now().map_err(|_| internal_error())? + i64::from(SEND_TTL_SECONDS);
@@ -112,6 +143,8 @@ impl NotifyState {
             id: id.clone(),
             title: request.title,
             body: request.body,
+            image_url: request.image_url,
+            url: request.url,
             expires_at,
             ack_capability: ack_capability.clone(),
         };
@@ -120,27 +153,21 @@ impl NotifyState {
             return Err(invalid_payload());
         }
 
-        if subscriptions.is_empty() {
-            return Ok(DeliverySummary {
+        if authorized.subscriptions.is_empty() {
+            return Ok(SendPlan::NoDevices(DeliverySummary {
                 id,
                 attempted: 0,
                 accepted: 0,
                 failed: 0,
                 expired_subscriptions_removed: 0,
                 outcome: DeliveryOutcome::NoDevices,
-            });
+            }));
         }
 
-        let total_recipients = u32::try_from(subscriptions.len()).map_err(|_| internal_error())?;
-
-        let _send_slot = self
-            .0
-            .send_slots
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| capacity_error())?;
-
-        let prepared = subscriptions
+        let total_recipients =
+            u32::try_from(authorized.subscriptions.len()).map_err(|_| internal_error())?;
+        let messages = authorized
+            .subscriptions
             .into_iter()
             .map(|subscription| {
                 let message =
@@ -148,6 +175,28 @@ impl NotifyState {
                 Ok((subscription, message))
             })
             .collect::<Result<Vec<_>, NotifyError>>()?;
+
+        Ok(SendPlan::Ready(PreparedSend {
+            id,
+            ack_capability,
+            total_recipients,
+            messages,
+            _send_slot: authorized._send_slot,
+        }))
+    }
+
+    pub async fn dispatch(&self, plan: SendPlan) -> Result<DeliverySummary, NotifyError> {
+        let prepared = match plan {
+            SendPlan::NoDevices(summary) => return Ok(summary),
+            SendPlan::Ready(prepared) => prepared,
+        };
+        let PreparedSend {
+            id,
+            ack_capability,
+            total_recipients,
+            messages,
+            _send_slot,
+        } = prepared;
 
         self.0
             .acknowledgements
@@ -159,7 +208,7 @@ impl NotifyState {
         let accepted = Arc::new(AtomicU32::new(0));
         let expired_removed = Arc::new(AtomicU32::new(0));
         let mut deliveries = JoinSet::new();
-        for (subscription, message) in prepared {
+        for (subscription, message) in messages {
             let store = self.0.store.clone();
             let transport = Arc::clone(&self.0.transport);
             let provider_slots = Arc::clone(&self.0.provider_slots);
@@ -310,6 +359,24 @@ fn validate_request(request: &NotificationRequest) -> Result<(), NotifyError> {
                 .any(|character| character.is_control() && !matches!(character, '\n' | '\r' | '\t'))
     }) {
         return Err(invalid_payload());
+    }
+    for value in [request.image_url.as_deref(), request.url.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        if value.len() > 2048 {
+            return Err(invalid_payload());
+        }
+        let Ok(url) = Url::parse(value) else {
+            return Err(invalid_payload());
+        };
+        if url.scheme() != "https"
+            || url.host_str().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+        {
+            return Err(invalid_payload());
+        }
     }
     Ok(())
 }
@@ -477,12 +544,24 @@ mod tests {
         (state, store, fake, secret, directory)
     }
 
+    async fn send(
+        state: &NotifyState,
+        secret: String,
+        request: NotificationRequest,
+    ) -> Result<chime_protocol::DeliverySummary, super::NotifyError> {
+        let authorized = state.authorize(secret).await?;
+        let plan = state.prepare(authorized, request)?;
+        state.dispatch(plan).await
+    }
+
     #[test]
     fn validates_notification_text_by_utf8_bytes_before_delivery() {
         assert!(
             validate_request(&NotificationRequest {
                 title: "Hello".into(),
                 body: Some("Build complete".into()),
+                image_url: None,
+                url: None,
             })
             .is_ok()
         );
@@ -490,13 +569,41 @@ mod tests {
             validate_request(&NotificationRequest {
                 title: " ".into(),
                 body: None,
+                image_url: None,
+                url: None,
             })
             .is_err()
+        );
+        for url in [
+            "http://example.com/image.png".to_owned(),
+            "https://user@example.com/image.png".to_owned(),
+            format!("https://example.com/{}", "x".repeat(2040)),
+        ] {
+            assert!(
+                validate_request(&NotificationRequest {
+                    title: "Hello".into(),
+                    body: None,
+                    image_url: Some(url),
+                    url: None,
+                })
+                .is_err()
+            );
+        }
+        assert!(
+            validate_request(&NotificationRequest {
+                title: "Hello".into(),
+                body: None,
+                image_url: Some("https://images.example/build.png".into()),
+                url: Some("https://example.com/build".into()),
+            })
+            .is_ok()
         );
         assert!(
             validate_request(&NotificationRequest {
                 title: "é".repeat(MAX_TITLE_BYTES / 2 + 1),
                 body: None,
+                image_url: None,
+                url: None,
             })
             .is_err()
         );
@@ -504,6 +611,8 @@ mod tests {
             validate_request(&NotificationRequest {
                 title: "Hello".into(),
                 body: Some("é".repeat(MAX_BODY_BYTES / 2 + 1)),
+                image_url: None,
+                url: None,
             })
             .is_err()
         );
@@ -516,16 +625,18 @@ mod tests {
             ProviderResult::Accepted,
         )
         .await;
-        let summary = state
-            .send(
-                secret,
-                NotificationRequest {
-                    title: "Build complete".into(),
-                    body: Some("All checks passed".into()),
-                },
-            )
-            .await
-            .unwrap();
+        let summary = send(
+            &state,
+            secret,
+            NotificationRequest {
+                title: "Build complete".into(),
+                body: Some("All checks passed".into()),
+                image_url: None,
+                url: None,
+            },
+        )
+        .await
+        .unwrap();
 
         assert_eq!(summary.attempted, 1);
         assert_eq!(summary.accepted, 1);
@@ -546,16 +657,18 @@ mod tests {
     #[tokio::test]
     async fn no_devices_returns_a_distinct_success_summary() {
         let (state, _store, fake, secret, _directory) = fixture("", ProviderResult::Accepted).await;
-        let summary = state
-            .send(
-                secret,
-                NotificationRequest {
-                    title: "Hello".into(),
-                    body: None,
-                },
-            )
-            .await
-            .unwrap();
+        let summary = send(
+            &state,
+            secret,
+            NotificationRequest {
+                title: "Hello".into(),
+                body: None,
+                image_url: None,
+                url: None,
+            },
+        )
+        .await
+        .unwrap();
         assert_eq!(summary.attempted, 0);
         assert_eq!(summary.outcome, chime_protocol::DeliveryOutcome::NoDevices);
         assert_eq!(fake.requests.load(Ordering::Relaxed), 0);
@@ -569,13 +682,14 @@ mod tests {
         let request = NotificationRequest {
             title: "Hello".into(),
             body: None,
+            image_url: None,
+            url: None,
         };
-        let unauthorized = state
-            .send("invalid".into(), request.clone())
+        let unauthorized = send(&state, "invalid".into(), request.clone())
             .await
             .unwrap_err();
         assert_eq!(unauthorized.status, axum::http::StatusCode::UNAUTHORIZED);
-        let limited = state.send(secret, request).await.unwrap_err();
+        let limited = send(&state, secret, request).await.unwrap_err();
         assert_eq!(limited.status, axum::http::StatusCode::TOO_MANY_REQUESTS);
     }
 
@@ -583,16 +697,41 @@ mod tests {
     async fn fake_transport_cannot_bypass_production_endpoint_validation() {
         let (state, _store, fake, secret, _directory) =
             fixture("https://127.0.0.1/private", ProviderResult::Accepted).await;
-        let error = state
-            .send(
-                secret,
-                NotificationRequest {
-                    title: "Hello".into(),
-                    body: None,
-                },
-            )
-            .await
-            .unwrap_err();
+        let error = send(
+            &state,
+            secret,
+            NotificationRequest {
+                title: "Hello".into(),
+                body: None,
+                image_url: None,
+                url: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(fake.requests.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn oversized_payload_is_rejected_before_any_push_request() {
+        let (state, _store, fake, secret, _directory) = fixture(
+            "https://fcm.googleapis.com/fcm/send/test",
+            ProviderResult::Accepted,
+        )
+        .await;
+        let error = send(
+            &state,
+            secret,
+            NotificationRequest {
+                title: "Hello".into(),
+                body: None,
+                image_url: Some(format!("https://images.example/{}", "a".repeat(1800))),
+                url: Some(format!("https://example.com/{}", "b".repeat(1000))),
+            },
+        )
+        .await
+        .unwrap_err();
         assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
         assert_eq!(fake.requests.load(Ordering::Relaxed), 0);
     }
@@ -604,16 +743,18 @@ mod tests {
             ProviderResult::Expired,
         )
         .await;
-        let summary = state
-            .send(
-                secret,
-                NotificationRequest {
-                    title: "Hello".into(),
-                    body: None,
-                },
-            )
-            .await
-            .unwrap();
+        let summary = send(
+            &state,
+            secret,
+            NotificationRequest {
+                title: "Hello".into(),
+                body: None,
+                image_url: None,
+                url: None,
+            },
+        )
+        .await
+        .unwrap();
         assert_eq!(summary.accepted, 0);
         assert_eq!(summary.failed, 1);
         assert_eq!(summary.expired_subscriptions_removed, 1);
