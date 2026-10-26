@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing draft tag; select the same tag as the workflow ref
+        description: Existing draft tag to recover using the current main workflow
         required: true
         type: string
 
@@ -92,27 +92,39 @@ jobs:
       version: ${{ steps.ref.outputs.version }}
       source_sha: ${{ steps.ref.outputs.source_sha }}
     steps:
+      - name: Check out the current workflow branch for recovery
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
       - name: Validate the selected draft tag
         id: ref
         env:
           TAG: ${{ inputs.tag }}
           SELECTED_REF: ${{ github.ref }}
-          SOURCE_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           if [[ ! "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
             echo "tag must be a stable v<major>.<minor>.<patch> version" >&2
             exit 1
           fi
-          if [[ "$SELECTED_REF" != "refs/tags/$TAG" || ! "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "Select the same existing tag as the workflow ref" >&2
+          if [[ "$SELECTED_REF" != "refs/heads/main" ]]; then
+            echo "Run recovery from main, using the existing release tag as the input" >&2
+            exit 1
+          fi
+          # Resolve the immutable release source independently of the workflow ref.
+          source_sha=$(git rev-parse --verify "$TAG^{commit}")
+          if [[ ! "$source_sha" =~ ^[0-9a-f]{40}$ ]] ||
+             ! git merge-base --is-ancestor "$source_sha" HEAD; then
+            echo "The release tag must resolve to an existing commit on main" >&2
             exit 1
           fi
           {
             echo "publish=true"
             echo "tag=$TAG"
             echo "version=${TAG#v}"
-            echo "source_sha=$SOURCE_SHA"
+            echo "source_sha=$source_sha"
           } >> "$GITHUB_OUTPUT"
 
   artifacts:
@@ -152,14 +164,26 @@ jobs:
             exit 1
           fi
 
-          release_json=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG")
-          jq -e --arg tag "$TAG" '.tag_name == $tag and .draft == true and .published_at == null' \
-            <<< "$release_json" >/dev/null || {
-              echo "Release $TAG is missing, mismatched, or already published; published releases are terminal" >&2
-              exit 1
-            }
-          release_id=$(jq -r '.id' <<< "$release_json")
+          # By-tag release lookup excludes drafts; an authenticated listing includes them.
+          releases=$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100")
+          release_id=$(jq -er --arg tag "$TAG" '
+            [.[][] | select(.tag_name == $tag)] as $matches
+            | if ($matches | length) == 1 and
+                 $matches[0].draft == true and
+                 $matches[0].published_at == null
+              then $matches[0].id
+              else error("Expected exactly one unpublished draft release for " + $tag)
+              end
+          ' <<< "$releases")
           [[ "$release_id" =~ ^[0-9]+$ ]]
+          release_json=$(gh api "repos/$GITHUB_REPOSITORY/releases/$release_id")
+          jq -e --arg tag "$TAG" --argjson id "$release_id" '
+            .id == $id and .tag_name == $tag and
+            .draft == true and .published_at == null
+          ' <<< "$release_json" >/dev/null || {
+            echo "Draft release changed or is no longer available for $TAG" >&2
+            exit 1
+          }
 
           python3 - "$VERSION" <<'PY'
           import json
@@ -228,11 +252,9 @@ jobs:
           reuse_dir="$RUNNER_TEMP/chime-cli-reuse"
           mkdir -p "$reuse_dir"
           if [[ "$archive_count" -eq 1 ]]; then
-            gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
-              --pattern "$CLI_ARCHIVE" --dir "$reuse_dir"
+            gh api "repos/$GITHUB_REPOSITORY/releases/assets/$(jq -er --arg name "$CLI_ARCHIVE" '[.[][] | select(.name == $name and .state == "uploaded") | .id] | if length == 1 then .[0] else error("Invalid CLI asset") end' <<< "$assets")" -H "Accept: application/octet-stream" > "$reuse_dir/$CLI_ARCHIVE"
             if [[ "$checksum_count" -eq 1 ]]; then
-              gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
-                --pattern "$CLI_ARCHIVE.sha256" --dir "$reuse_dir"
+              gh api "repos/$GITHUB_REPOSITORY/releases/assets/$(jq -er --arg name "$CLI_ARCHIVE.sha256" '[.[][] | select(.name == $name and .state == "uploaded") | .id] | if length == 1 then .[0] else error("Invalid checksum asset") end' <<< "$assets")" -H "Accept: application/octet-stream" > "$reuse_dir/$CLI_ARCHIVE.sha256"
             else
               (
                 cd "$reuse_dir"
@@ -251,8 +273,7 @@ jobs:
             cp "$reuse_dir/$CLI_ARCHIVE.sha256" "dist/$CLI_ARCHIVE.sha256"
             echo "reuse=true" >> "$GITHUB_OUTPUT"
           elif [[ "$checksum_count" -eq 1 ]]; then
-            gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
-              --pattern "$CLI_ARCHIVE.sha256" --dir "$reuse_dir"
+            gh api "repos/$GITHUB_REPOSITORY/releases/assets/$(jq -er --arg name "$CLI_ARCHIVE.sha256" '[.[][] | select(.name == $name and .state == "uploaded") | .id] | if length == 1 then .[0] else error("Invalid checksum asset") end' <<< "$assets")" -H "Accept: application/octet-stream" > "$reuse_dir/$CLI_ARCHIVE.sha256"
             cp "dist/$CLI_ARCHIVE" "$reuse_dir/$CLI_ARCHIVE"
             (
               cd "$reuse_dir"
@@ -490,14 +511,19 @@ jobs:
             count=$(jq 'length' <<< "$matches")
             if [[ "$count" -eq 0 ]]; then
               assert_draft
-              gh release upload "$TAG" "$path" --repo "$GITHUB_REPOSITORY"
+              gh api --method POST --hostname uploads.github.com \
+                "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?name=$name" \
+                -H "Content-Type: application/octet-stream" --input "$path" >/dev/null
             elif [[ "$count" -ne 1 ]]; then
               echo "Release has duplicate assets named $name; refusing to replace them" >&2
               exit 1
             fi
             download_dir=$(mktemp -d)
-            gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
-              --pattern "$name" --dir "$download_dir"
+            assets=$(gh api --paginate --slurp \
+              "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?per_page=100")
+            asset_id=$(jq -er --arg name "$name" '[.[][] | select(.name == $name and .state == "uploaded") | .id] | if length == 1 then .[0] else error("Invalid asset") end' <<< "$assets")
+            gh api "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" \
+              -H "Accept: application/octet-stream" > "$download_dir/$name"
             if ! cmp --silent "$path" "$download_dir/$name"; then
               echo "Existing draft asset $name differs from the deterministic local artifact; refusing to replace it" >&2
               rm -rf "$download_dir"
@@ -547,8 +573,8 @@ jobs:
           PY
           release_json=$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID")
           jq -e --arg tag "$TAG" '.tag_name == $tag and .draft == true' <<< "$release_json" >/dev/null
-          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" \
-            --notes-file "$RUNNER_TEMP/release-notes.md"
+          gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
+            --raw-field "body=$(cat "$RUNNER_TEMP/release-notes.md")" >/dev/null
 
       - name: Publish the complete verified release
         env:
