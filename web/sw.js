@@ -22,15 +22,12 @@ self.addEventListener("push", (event) => {
 });
 
 self.addEventListener("notificationclick", (event) => {
-  const opening = openNotificationUrl(event.notification, (url) => self.clients.openWindow(url));
-  const localWork = enqueuePush(async () => {
-    const data = event.notification.data ?? {};
-    await Promise.allSettled([
-      rememberDismissedNotification(data.id, data.expires_at),
-      acknowledgeNotification(data),
-    ]);
-  });
-  event.waitUntil(Promise.allSettled([opening, localWork]));
+  event.waitUntil(handleNotificationClick(
+    event.notification,
+    (url) => self.clients.openWindow(url),
+    acknowledgeNotification,
+    self.registration,
+  ));
 });
 
 export function enqueuePush(work) {
@@ -57,16 +54,26 @@ export function openNotificationUrl(notification, openWindow) {
   return null;
 }
 
-export function handleNotificationClick(notification, openWindow, acknowledge = acknowledgeNotification) {
+export function handleNotificationClick(
+  notification,
+  openWindow,
+  acknowledge = acknowledgeNotification,
+  registration = self.registration,
+) {
   const opening = openNotificationUrl(notification, openWindow);
+  const data = notification.data ?? {};
   const localWork = enqueuePush(async () => {
-    const data = notification.data ?? {};
-    await Promise.allSettled([
-      rememberDismissedNotification(data.id, data.expires_at),
-      acknowledge(data),
-    ]);
+    try {
+      await rememberDismissedNotification(data.id, data.expires_at);
+    } catch {
+      // Local dismissal must still close a notification if IndexedDB is unavailable.
+    }
+    if (!validId(data.id)) return;
+    const notifications = await registration.getNotifications({ tag: `chime-${data.id}` });
+    for (const item of notifications) item.close();
   });
-  return Promise.allSettled([opening, localWork]);
+  const acknowledgement = Promise.resolve().then(() => acknowledge(data));
+  return Promise.allSettled([opening, localWork, acknowledgement]);
 }
 
 export async function acknowledgeNotification(data) {

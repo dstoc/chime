@@ -581,7 +581,7 @@ const dismissalBrowserChecks = await evaluate(`(async () => {
   }, () => {
     ackStarted = true;
     return new Promise(resolve => { releaseAck = resolve; });
-  });
+  }, registration);
   const openedImmediately = clickOrder.join(',') === 'close,open' && !ackStarted;
   await new Promise(resolve => setTimeout(resolve, 0));
   const openedBeforeAckCompleted = clickOrder.includes('open') && ackStarted;
@@ -590,6 +590,67 @@ const dismissalBrowserChecks = await evaluate(`(async () => {
   const clickedMemory = await tokens.isNotificationDismissed(clickedId);
   const clickedNotify = { ...notify, id: clickedId };
   const clickedRedisplay = await worker.displayPayload(registration, clickedNotify);
+
+  const queueClickId = 'Q'.repeat(22);
+  let queueAckStarted = false;
+  let releaseQueueAck;
+  const queuedClick = worker.handleNotificationClick({
+    data: { id: queueClickId, expires_at: expiresAt, ack_capability: 'C'.repeat(43) },
+    close: () => {},
+  }, () => null, () => {
+    queueAckStarted = true;
+    return new Promise(resolve => { releaseQueueAck = resolve; });
+  }, registration);
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const laterNotify = { ...notify, id: 'L'.repeat(22) };
+  const laterPush = worker.enqueuePush(() => worker.handlePushPayload(registration, laterNotify));
+  const laterPushAdvanced = await Promise.race([
+    laterPush.then(result => result === true),
+    new Promise(resolve => setTimeout(() => resolve(false), 250)),
+  ]);
+  const acknowledgementDidNotBlockQueue = queueAckStarted && laterPushAdvanced;
+  releaseQueueAck();
+  await queuedClick;
+
+  const inflightId = 'I'.repeat(22);
+  const inflightVisible = new Map();
+  let releaseDisplay;
+  let displayFinished = false;
+  let closedAfterDisplay = false;
+  let markDisplayStarted;
+  const displayStarted = new Promise(resolve => { markDisplayStarted = resolve; });
+  const inflightRegistration = {
+    showNotification: async (title, options) => {
+      markDisplayStarted();
+      await new Promise(resolve => { releaseDisplay = resolve; });
+      const notification = {
+        title,
+        data: { id: inflightId },
+        close: () => {
+          if (displayFinished) closedAfterDisplay = true;
+          inflightVisible.delete(options.tag);
+        },
+      };
+      inflightVisible.set(options.tag, notification);
+      displayFinished = true;
+    },
+    getNotifications: async ({ tag } = {}) => tag
+      ? [...inflightVisible.entries()].filter(([key]) => key === tag).map(([, value]) => value)
+      : [...inflightVisible.values()],
+  };
+  const inFlightDisplay = worker.enqueuePush(() => worker.handlePushPayload(inflightRegistration, {
+    ...notify,
+    id: inflightId,
+  }));
+  await displayStarted;
+  const clickDuringDisplay = worker.handleNotificationClick({
+    data: { id: inflightId, expires_at: expiresAt, ack_capability: 'D'.repeat(43) },
+    close: () => {},
+  }, () => null, async () => {}, inflightRegistration);
+  releaseDisplay();
+  await Promise.all([inFlightDisplay, clickDuringDisplay]);
+  const clickClosedInflightDisplay = closedAfterDisplay && inflightVisible.size === 0
+    && await tokens.isNotificationDismissed(inflightId);
 
   const expiredId = 'E'.repeat(22);
   await tokens.rememberDismissedNotification(expiredId, now + 2, now);
@@ -637,6 +698,8 @@ const dismissalBrowserChecks = await evaluate(`(async () => {
     openedBeforeAckCompleted,
     clickedMemory,
     clickedRedisplay,
+    acknowledgementDidNotBlockQueue,
+    clickClosedInflightDisplay,
     expiredRecordRemoved,
     boundedSet,
     removalClearedSet,
@@ -646,7 +709,8 @@ if (!dismissalBrowserChecks.concurrentPairClosed || !dismissalBrowserChecks.late
   || !dismissalBrowserChecks.unmatchedIsNoOp || !dismissalBrowserChecks.closedDespiteStorageFailure
   || !dismissalBrowserChecks.notifySurvivesStorageFailure || !dismissalBrowserChecks.openedImmediately
   || !dismissalBrowserChecks.openedBeforeAckCompleted || !dismissalBrowserChecks.clickedMemory
-  || dismissalBrowserChecks.clickedRedisplay !== false || !dismissalBrowserChecks.expiredRecordRemoved
+  || dismissalBrowserChecks.clickedRedisplay !== false || !dismissalBrowserChecks.acknowledgementDidNotBlockQueue
+  || !dismissalBrowserChecks.clickClosedInflightDisplay || !dismissalBrowserChecks.expiredRecordRemoved
   || !dismissalBrowserChecks.boundedSet || !dismissalBrowserChecks.removalClearedSet) {
   throw new Error(`browser dismissal checks failed: ${JSON.stringify(dismissalBrowserChecks)}`);
 }
