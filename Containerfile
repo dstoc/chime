@@ -14,6 +14,8 @@ RUN cargo build --locked --release --package chime-server
 
 FROM docker.io/library/debian:12.15-slim AS runtime
 
+LABEL org.opencontainers.image.source="https://github.com/dstoc/chime"
+
 RUN apt-get update \
     && apt-get install --no-install-recommends -y ca-certificates libgcc-s1 libssl3 libzstd1 zlib1g \
     && rm -rf /var/lib/apt/lists/* \

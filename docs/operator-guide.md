@@ -1,15 +1,15 @@
 # Rootless Podman deployment
 
-This guide runs Chime and Tailscale as two rootless Quadlet container services. Tailscale owns the network namespace. Chime joins that namespace and keeps listening on `127.0.0.1:8080`, where Tailscale Serve can reach it. The host publishes no ports. Chime uses ordinary container egress for Web Push; it does not send provider traffic through Tailscale.
+This guide runs a published Chime image and Tailscale as two rootless Quadlet container services. Tailscale owns the network namespace. Chime joins that namespace and keeps listening on `127.0.0.1:8080`, where Tailscale Serve can reach it. The host publishes no ports. Chime uses ordinary container egress for Web Push; it does not send provider traffic through Tailscale.
 
-The example pins the Rust, Debian, and Tailscale image versions. Review and update those versions deliberately. Image builds need registry, Debian package, and Cargo registry access, but no production credentials.
+The example pins a Chime release and a Tailscale image version. Review and update those versions deliberately. Chime image pulls need GHCR access; the published package is public and does not require registry credentials.
 
 ## Requirements and lifecycle behavior
 
 - Linux with rootless Podman and Quadlet 5.4.2 or newer, systemd 252 or newer, and cgroup v2. Podman 5.4.2 documents `Network=<name>.container`; the systemd dependencies used here are available in systemd 252. See the [Podman Quadlet reference](https://docs.podman.io/en/v5.4.2/markdown/podman-systemd.unit.5.html) and [systemd unit reference](https://www.freedesktop.org/software/systemd/man/252/systemd.unit.html).
 - A rootless Podman user with subordinate UID/GID mappings configured.
 - A Tailscale tailnet with MagicDNS and HTTPS certificates enabled. The operator must configure tailnet access grants; the example does not enable Funnel.
-- A checkout of Chime on the host.
+- `curl` to download the two container units and Serve configuration from a Chime release tag.
 
 The Chime service declares `Network=chime-tailscale.container`. Quadlet generates its dependency on `chime-tailscale.service`. `After=`, `BindsTo=`, and `PartOf=` make Chime stop when Tailscale stops or becomes inactive and propagate a Tailscale restart to Chime. Tailscale declares `Wants=chime.service`, so starting Tailscale starts Chime again. Starting Chime directly also starts Tailscale through the generated network dependency.
 
@@ -19,24 +19,30 @@ The version numbers above are the documented feature floor, not the result of a 
 
 ## Install and edit the units
 
-From the Chime checkout, copy the units and Serve configuration:
+Choose a published Chime version. The example uses the first planned release, `0.2.0`. Set `VERSION` to the release you want to deploy. Download the two container units and Serve configuration from that tag:
 
 ```sh
+VERSION=0.2.0
+BASE="https://raw.githubusercontent.com/dstoc/chime/v${VERSION}/examples/quadlet"
 mkdir -p "$HOME/.config/containers/systemd" "$HOME/.config/chime/tailscale"
 chmod 0700 "$HOME/.config/containers/systemd" "$HOME/.config/chime" "$HOME/.config/chime/tailscale"
-install -m 0600 examples/quadlet/chime.build "$HOME/.config/containers/systemd/chime.build"
-install -m 0600 examples/quadlet/chime.container "$HOME/.config/containers/systemd/chime.container"
-install -m 0600 examples/quadlet/chime-tailscale.container "$HOME/.config/containers/systemd/chime-tailscale.container"
-install -m 0600 examples/quadlet/tailscale/serve.json "$HOME/.config/chime/tailscale/serve.json"
+curl --fail --location --output "$HOME/.config/containers/systemd/chime.container" "$BASE/chime.container"
+curl --fail --location --output "$HOME/.config/containers/systemd/chime-tailscale.container" "$BASE/chime-tailscale.container"
+curl --fail --location --output "$HOME/.config/chime/tailscale/serve.json" "$BASE/tailscale/serve.json"
+chmod 0600 "$HOME/.config/containers/systemd/chime.container" "$HOME/.config/containers/systemd/chime-tailscale.container" "$HOME/.config/chime/tailscale/serve.json"
 ```
 
-Edit `chime.build`. Replace both `/src/chime` paths with the absolute path to your checkout. Quadlet uses this directory as the build context and reads its `Containerfile`.
+Set the image version in `chime.container` to the release you selected. You can also use the release's SHA-256 digest to pin the exact image. Replace `https://chime.example-tailnet.ts.net` with the HTTPS origin you expect Tailscale to assign. Keep the origin as a scheme and DNS hostname with no path.
 
-Edit `chime.container`. Replace `https://chime.example-tailnet.ts.net` with the HTTPS origin you expect Tailscale to assign. Keep the origin as a scheme and DNS hostname with no path.
+```sh
+sed -i "s|^Image=.*|Image=ghcr.io/dstoc/chime:${VERSION}|" "$HOME/.config/containers/systemd/chime.container"
+# To pin by digest instead, set IMAGE_DIGEST from the release notes or digest asset:
+# sed -i "s|^Image=.*|Image=ghcr.io/dstoc/chime@${IMAGE_DIGEST}|" "$HOME/.config/containers/systemd/chime.container"
+```
 
 The sidecar requests the hostname `chime`. The actual tailnet FQDN can differ if that name is unavailable or the tailnet assigns a different name. Verify it before registering any passkeys, as described below.
 
-The generated service names are `chime-build.service`, `chime.service`, and `chime-tailscale.service`. Keep the two state directories separate. Chime's container remains non-root with a read-only root filesystem and one writable data mount. Tailscale uses userspace networking and receives its state, Serve configuration, and bootstrap secret through separate mounts or a Podman secret.
+The generated service names are `chime.service` and `chime-tailscale.service`. Keep the two state directories separate. Chime's container remains non-root with a read-only root filesystem and one writable data mount. Tailscale uses userspace networking and receives its state, Serve configuration, and bootstrap secret through separate mounts or a Podman secret.
 
 ## Create persistent directories and the bootstrap secret
 
@@ -61,18 +67,17 @@ unset TS_AUTHKEY
 
 The sidecar receives this secret as a read-only file and passes `file:/run/secrets/tailscale-authkey` to Tailscale's auth-key input. The key is not stored in the unit, image, or environment value. Protect access to the rootless Podman account and its secret store. See [Tailscale container parameters](https://tailscale.com/docs/features/containers/docker/docker-params) and the [Tailscale Serve container example](https://tailscale.com/blog/docker-tailscale-guide) for the supported environment settings and Serve configuration format.
 
-## Build and start
+## Pull and start
 
-Reload the user systemd manager, build the image, and start Tailscale. Its `Wants=` dependency starts Chime:
+Reload the user systemd manager and start Tailscale. Its `Wants=` dependency starts Chime and Podman pulls the selected image:
 
 ```sh
 systemctl --user daemon-reload
-systemctl --user start chime-build.service
 systemctl --user start chime-tailscale.service
 systemctl --user status chime-tailscale.service chime.service
 ```
 
-Quadlet applies each unit's `[Install]` section during generation, so `WantedBy=default.target` starts both services when the user manager starts. Do not run `systemctl --user enable` on generated Quadlet services. The build unit allows 15 minutes for the locked release build. Both container services use `Restart=always`. Unit ordering does not mean that Chime's HTTP listener, Tailscale authentication, or Serve configuration is ready.
+Quadlet applies each unit's `[Install]` section during generation, so `WantedBy=default.target` starts both services when the user manager starts. Do not run `systemctl --user enable` on generated Quadlet services. Both container services use `Restart=always`. Unit ordering does not mean that Chime's HTTP listener, Tailscale authentication, or Serve configuration is ready.
 
 Check the sidecar logs and its assigned name:
 
@@ -148,15 +153,17 @@ systemctl --user stop chime-tailscale.service
 
 Chime's persistent directory retains its SQLite database, VAPID identity, send keys, and subscriptions. The separate Tailscale state directory retains the node identity. If Tailscale is unavailable, Chime does not publish a host port. Check `tailscale status`, `tailscale serve status --json`, the configured origin, and both services' logs before diagnosing browser failures.
 
-### Rebuild or update Chime
+### Update Chime
 
-Build the updated checkout, then restart only Chime. Tailscale remains running:
+Select a released version or digest in `chime.container`, then reload Quadlet and restart Chime. Tailscale remains running:
 
 ```sh
-systemctl --user stop chime.service
-systemctl --user restart chime-build.service
-systemctl --user start chime.service
+sed -i 's|^Image=.*|Image=ghcr.io/dstoc/chime:0.2.0|' "$HOME/.config/containers/systemd/chime.container"
+systemctl --user daemon-reload
+systemctl --user restart chime.service
 ```
+
+Replace `0.2.0` with the selected version. To pin a digest, use `Image=ghcr.io/dstoc/chime@sha256:<digest>` instead. Podman pulls the new image when it starts the service.
 
 ### Update Tailscale
 
@@ -188,10 +195,10 @@ systemctl --user start chime-tailscale.service
 
 ### Check the generated dependency and namespace
 
-To inspect the generated services from this checkout, run the Quadlet generator in dry-run mode. The generator path can vary by distribution:
+To inspect the generated services, run the Quadlet generator in dry-run mode. The generator path can vary by distribution:
 
 ```sh
-QUADLET_UNIT_DIRS="$PWD/examples/quadlet" /usr/lib/systemd/system-generators/podman-system-generator --user --dryrun
+QUADLET_UNIT_DIRS="$HOME/.config/containers/systemd" /usr/lib/systemd/system-generators/podman-system-generator --user --dryrun
 ```
 
 Confirm that `chime.service` contains the generated dependency on `chime-tailscale.service` and retains `After=`, `BindsTo=`, and `PartOf=`. Confirm that `chime-tailscale.service` contains `Wants=chime.service`. There must be no ordering cycle.
@@ -213,12 +220,15 @@ Run this check after fresh startup, a Chime-only restart, a Tailscale stop/start
 The reset command needs the same Chime image and data mount as the server. Stop Chime first so it releases its exclusive data-directory lock. Then run the command as the container's UID and start Chime again:
 
 ```sh
+IMAGE=ghcr.io/dstoc/chime:0.2.0
 systemctl --user stop chime.service
 podman run --rm --network=none --read-only --user 10001:10001 \
   --volume "$HOME/.local/share/chime/data:/var/lib/chime:rw,Z" \
-  localhost/chime:0.1.0 reset-admin --data-dir /var/lib/chime
+  "$IMAGE" reset-admin --data-dir /var/lib/chime
 systemctl --user start chime.service
 ```
+
+Set `IMAGE` to the exact version or digest reference in `chime.container`.
 
 The command prints a new sensitive setup code. It clears administrator passkeys and preserves send keys, device subscriptions, and the VAPID identity. Revoke send keys separately if compromise is suspected. If the lock is unavailable, confirm that `chime.service` and any other process using this data directory have stopped before retrying.
 

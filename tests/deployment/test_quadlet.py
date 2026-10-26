@@ -24,25 +24,18 @@ class DeploymentConfigTests(unittest.TestCase):
         self.assertRegex(containerfile, r"(?m)^FROM docker\.io/library/rust:1\.99\.1-bookworm AS build$")
         self.assertRegex(containerfile, r"(?m)^FROM docker\.io/library/debian:12\.15-slim AS runtime$")
         self.assertIn("cargo build --locked --release --package chime-server", containerfile)
+        self.assertIn('LABEL org.opencontainers.image.source="https://github.com/dstoc/chime"', containerfile)
         self.assertIn("ca-certificates libgcc-s1 libssl3 libzstd1 zlib1g", containerfile)
         self.assertIn("USER 10001:10001", containerfile)
         self.assertIn("STOPSIGNAL SIGTERM", containerfile)
         self.assertIn("RUN /usr/local/bin/chime-server --help >/dev/null", containerfile)
         self.assertIn('ENTRYPOINT ["/usr/local/bin/chime-server"]', containerfile)
 
-    def test_build_quadlet_uses_checkout_and_allows_release_build_time(self) -> None:
-        unit = read_unit("chime.build")
-
-        self.assertEqual(unit["Build"]["ImageTag"], "localhost/chime:0.1.0")
-        self.assertEqual(unit["Build"]["File"], "%h/src/chime/Containerfile")
-        self.assertEqual(unit["Build"]["SetWorkingDirectory"], "%h/src/chime")
-        self.assertEqual(unit["Service"]["TimeoutStartSec"], "900")
-
     def test_chime_joins_tailscale_namespace_and_restarts_with_it(self) -> None:
         unit = read_unit("chime.container")
         container = unit["Container"]
 
-        self.assertEqual(container["Image"], "chime.build")
+        self.assertEqual(container["Image"], "ghcr.io/dstoc/chime:0.2.0")
         self.assertEqual(container["Network"], "chime-tailscale.container")
         self.assertEqual(
             set(unit["Unit"]["After"].split()), {"chime-tailscale.service"}
@@ -63,6 +56,7 @@ class DeploymentConfigTests(unittest.TestCase):
         self.assertNotIn("Secret=", (QUADLET / "chime.container").read_text(encoding="utf-8"))
         self.assertEqual(unit["Service"]["Restart"], "always")
         self.assertFalse((QUADLET / "chime.pod").exists())
+        self.assertFalse((QUADLET / "chime.build").exists())
 
     def test_tailscale_uses_file_secret_persistent_state_and_starts_chime(self) -> None:
         unit = read_unit("chime-tailscale.container")
@@ -90,7 +84,6 @@ class DeploymentConfigTests(unittest.TestCase):
 
     def test_two_containers_do_not_publish_or_gain_host_privileges(self) -> None:
         unit_files = [
-            QUADLET / "chime.build",
             QUADLET / "chime.container",
             QUADLET / "chime-tailscale.container",
         ]

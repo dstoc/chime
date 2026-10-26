@@ -26,5 +26,7 @@ jobs:
         run: cargo build --workspace --bins --locked
       - name: Check container and Quadlet configuration
         run: python3 -m unittest discover --start-directory tests/deployment --pattern 'test_*.py'
+      - name: Check release configuration and packaging
+        run: python3 -m unittest discover --start-directory tests/release --pattern 'test_*.py'
       - name: Build container image
         run: docker build --file Containerfile --tag chime:ci .

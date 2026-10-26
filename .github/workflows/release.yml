@@ -1,0 +1,557 @@
+name: release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing draft tag; select the same tag as the workflow ref
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: chime-release
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    outputs:
+      publish: ${{ steps.release.outputs.publish }}
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+      source_sha: ${{ steps.release.outputs.source_sha }}
+    steps:
+      - name: Update the release PR or create a draft release
+        id: release_please
+        uses: googleapis/release-please-action@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+      - name: Export release outputs
+        id: release
+        env:
+          RELEASE_CREATED: ${{ steps.release_please.outputs.release_created }}
+          RELEASE_TAG: ${{ steps.release_please.outputs.tag_name }}
+          RELEASE_VERSION: ${{ steps.release_please.outputs.version }}
+          RELEASE_SHA: ${{ steps.release_please.outputs.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$RELEASE_CREATED" != "true" ]]; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [[ ! "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "Release Please returned an invalid stable tag: $RELEASE_TAG" >&2
+            exit 1
+          fi
+          if [[ "$RELEASE_TAG" != "v$RELEASE_VERSION" || ! "$RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Release Please tag, version, and source commit do not agree" >&2
+            exit 1
+          fi
+          {
+            echo "publish=true"
+            echo "tag=$RELEASE_TAG"
+            echo "version=$RELEASE_VERSION"
+            echo "source_sha=$RELEASE_SHA"
+          } >> "$GITHUB_OUTPUT"
+
+  recovery:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      publish: ${{ steps.ref.outputs.publish }}
+      tag: ${{ steps.ref.outputs.tag }}
+      version: ${{ steps.ref.outputs.version }}
+      source_sha: ${{ steps.ref.outputs.source_sha }}
+    steps:
+      - name: Validate the selected draft tag
+        id: ref
+        env:
+          TAG: ${{ inputs.tag }}
+          SELECTED_REF: ${{ github.ref }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "tag must be a stable v<major>.<minor>.<patch> version" >&2
+            exit 1
+          fi
+          if [[ "$SELECTED_REF" != "refs/tags/$TAG" || ! "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Select the same existing tag as the workflow ref" >&2
+            exit 1
+          fi
+          {
+            echo "publish=true"
+            echo "tag=$TAG"
+            echo "version=${TAG#v}"
+            echo "source_sha=$SOURCE_SHA"
+          } >> "$GITHUB_OUTPUT"
+
+  artifacts:
+    needs: [release-please, recovery]
+    if: >-
+      always() &&
+      ((needs['release-please'].result == 'success' && needs['release-please'].outputs.publish == 'true') ||
+       (needs.recovery.result == 'success' && needs.recovery.outputs.publish == 'true'))
+    runs-on: ubuntu-latest
+    permissions:
+      attestations: write
+      contents: write
+      id-token: write
+      packages: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      VERSION: ${{ needs['release-please'].outputs.version || needs.recovery.outputs.version }}
+      TAG: ${{ needs['release-please'].outputs.tag || needs.recovery.outputs.tag }}
+      SOURCE_SHA: ${{ needs['release-please'].outputs.source_sha || needs.recovery.outputs.source_sha }}
+      CLI_ARCHIVE: chime-v${{ needs['release-please'].outputs.version || needs.recovery.outputs.version }}-x86_64-unknown-linux-gnu.tar.gz
+      IMAGE_REF: ghcr.io/dstoc/chime:${{ needs['release-please'].outputs.version || needs.recovery.outputs.version }}
+    steps:
+      - name: Check out the exact release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs['release-please'].outputs.tag || needs.recovery.outputs.tag }}
+          fetch-depth: 0
+
+      - name: Verify draft, source, and shared workspace version
+        id: release
+        run: |
+          set -euo pipefail
+          actual_sha=$(git rev-parse HEAD)
+          tag_sha=$(git rev-parse "$TAG^{commit}")
+          if [[ "$actual_sha" != "$SOURCE_SHA" || "$tag_sha" != "$SOURCE_SHA" ]]; then
+            echo "The selected tag does not resolve to the expected release source commit" >&2
+            exit 1
+          fi
+
+          release_json=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG")
+          jq -e --arg tag "$TAG" '.tag_name == $tag and .draft == true and .published_at == null' \
+            <<< "$release_json" >/dev/null || {
+              echo "Release $TAG is missing, mismatched, or already published; published releases are terminal" >&2
+              exit 1
+            }
+          release_id=$(jq -r '.id' <<< "$release_json")
+          [[ "$release_id" =~ ^[0-9]+$ ]]
+
+          python3 - "$VERSION" <<'PY'
+          import json
+          import sys
+          import tomllib
+          from pathlib import Path
+
+          expected = sys.argv[1]
+          root = Path.cwd()
+          manifest = json.loads((root / ".release-please-manifest.json").read_text())
+          workspace = tomllib.loads((root / "Cargo.toml").read_text())
+          lock = tomllib.loads((root / "Cargo.lock").read_text())
+          release_version = (root / "release-version.txt").read_text().strip()
+          assert manifest == {".": expected}, manifest
+          assert release_version == expected, release_version
+          assert workspace["workspace"]["package"]["version"] == expected
+          members = {"chime-cli", "chime-protocol", "chime-server"}
+          local_packages = [
+              package for package in lock["package"]
+              if package["name"] in members and "source" not in package
+          ]
+          assert {package["name"] for package in local_packages} == members
+          assert len(local_packages) == len(members)
+          assert all(package["version"] == expected for package in local_packages)
+          for name in members:
+              manifest_path = root / "crates" / name / "Cargo.toml"
+              member = tomllib.loads(manifest_path.read_text())
+              assert member["package"]["version"] == {"workspace": True}, name
+          PY
+
+          echo "release_id=$release_id" >> "$GITHUB_OUTPUT"
+
+      - name: Build and package the Linux CLI
+        run: |
+          set -euo pipefail
+          docker run --rm --platform linux/amd64 \
+            --volume "$PWD:/build" \
+            --workdir /build \
+            docker.io/library/rust:1.99.1-bookworm \
+            sh -ec 'apt-get update >/dev/null && apt-get install --no-install-recommends -y build-essential libssl-dev pkg-config >/dev/null && cargo build --locked --release --package chime-cli --target x86_64-unknown-linux-gnu'
+          source_epoch=$(git show -s --format=%ct "$SOURCE_SHA")
+          ./scripts/package-cli.sh "$VERSION" "$source_epoch" \
+            "target/x86_64-unknown-linux-gnu/release/chime" dist
+          (
+            cd dist
+            sha256sum -c "$CLI_ARCHIVE.sha256"
+          )
+
+      - name: Reuse an existing CLI asset only after checksum and provenance verification
+        id: cli_asset
+        env:
+          RELEASE_ID: ${{ steps.release.outputs.release_id }}
+        run: |
+          set -euo pipefail
+          assets=$(gh api --paginate --slurp \
+            "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?per_page=100")
+          archive_count=$(jq --arg name "$CLI_ARCHIVE" \
+            '[.[][] | select(.name == $name)] | length' <<< "$assets")
+          checksum_count=$(jq --arg name "$CLI_ARCHIVE.sha256" \
+            '[.[][] | select(.name == $name)] | length' <<< "$assets")
+          if [[ "$archive_count" -gt 1 || "$checksum_count" -gt 1 ]]; then
+            echo "Draft release has duplicate CLI assets; refusing to replace them" >&2
+            exit 1
+          fi
+
+          reuse_dir="$RUNNER_TEMP/chime-cli-reuse"
+          mkdir -p "$reuse_dir"
+          if [[ "$archive_count" -eq 1 ]]; then
+            gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --pattern "$CLI_ARCHIVE" --dir "$reuse_dir"
+            if [[ "$checksum_count" -eq 1 ]]; then
+              gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+                --pattern "$CLI_ARCHIVE.sha256" --dir "$reuse_dir"
+            else
+              (
+                cd "$reuse_dir"
+                sha256sum "$CLI_ARCHIVE" > "$CLI_ARCHIVE.sha256"
+              )
+            fi
+            (
+              cd "$reuse_dir"
+              sha256sum --check "$CLI_ARCHIVE.sha256"
+            )
+            gh attestation verify "$reuse_dir/$CLI_ARCHIVE" \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+              --source-digest "$SOURCE_SHA"
+            cp "$reuse_dir/$CLI_ARCHIVE" "dist/$CLI_ARCHIVE"
+            cp "$reuse_dir/$CLI_ARCHIVE.sha256" "dist/$CLI_ARCHIVE.sha256"
+            echo "reuse=true" >> "$GITHUB_OUTPUT"
+          elif [[ "$checksum_count" -eq 1 ]]; then
+            gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --pattern "$CLI_ARCHIVE.sha256" --dir "$reuse_dir"
+            cp "dist/$CLI_ARCHIVE" "$reuse_dir/$CLI_ARCHIVE"
+            (
+              cd "$reuse_dir"
+              sha256sum --check "$CLI_ARCHIVE.sha256"
+            )
+            cp "$reuse_dir/$CLI_ARCHIVE.sha256" "dist/$CLI_ARCHIVE.sha256"
+            echo "reuse=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "reuse=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run the CLI in a clean Debian runtime
+        run: |
+          set -euo pipefail
+          output=$(docker run --rm \
+            --volume "$PWD/dist:/dist:ro" \
+            --env EXPECTED_VERSION="$VERSION" \
+            docker.io/library/debian:12.15-slim \
+            sh -ec 'apt-get update >/dev/null && apt-get install --no-install-recommends -y ca-certificates libgcc-s1 libssl3 libzstd1 zlib1g >/dev/null && test "$(/dist/chime --version)" = "chime $EXPECTED_VERSION"')
+          [[ -z "$output" ]]
+
+      - name: Log in to GHCR for version lookup and attestations
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Find an existing registry version without masking API errors
+        id: registry
+        run: |
+          set -euo pipefail
+          endpoint="users/dstoc/packages/container/chime/versions?per_page=100"
+          headers="$RUNNER_TEMP/ghcr-lookup-headers.txt"
+          set +e
+          gh api --include --silent "$endpoint" > "$headers" 2>&1
+          api_status=$?
+          set -e
+          http_status=$(sed -nE '1s#^HTTP/[^ ]+ ([0-9]{3}).*#\1#p' "$headers")
+          if [[ $api_status -ne 0 ]]; then
+            if [[ "$http_status" != "404" ]]; then
+              cat "$headers" >&2
+              echo "GHCR lookup failed with HTTP ${http_status:-unknown}; refusing to treat it as an absent tag" >&2
+              exit 1
+            fi
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          versions=$(gh api --paginate --slurp "$endpoint")
+          matches=$(jq -c --arg tag "$VERSION" \
+            '[.[][] | select((.metadata.container.tags // []) | index($tag)) | .name]' \
+            <<< "$versions")
+          count=$(jq 'length' <<< "$matches")
+          if [[ "$count" -eq 0 ]]; then
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [[ "$count" -ne 1 ]]; then
+            echo "GHCR returned multiple versions for tag $VERSION; refusing to publish" >&2
+            exit 1
+          fi
+          digest=$(jq -r '.[0]' <<< "$matches")
+          if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "GHCR returned an invalid OCI digest for $VERSION" >&2
+            exit 1
+          fi
+          {
+            echo "exists=true"
+            echo "digest=$digest"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build and publish the tagged Linux AMD64 image
+        id: build_image
+        if: steps.registry.outputs.exists == 'false'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Containerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ env.IMAGE_REF }}
+
+      - name: Select and validate the immutable image digest
+        id: image
+        env:
+          EXISTING: ${{ steps.registry.outputs.exists }}
+          EXISTING_DIGEST: ${{ steps.registry.outputs.digest }}
+          BUILT_DIGEST: ${{ steps.build_image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          if [[ "$EXISTING" == "true" ]]; then
+            digest=$EXISTING_DIGEST
+          else
+            digest=$BUILT_DIGEST
+          fi
+          if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "No valid OCI image digest was produced" >&2
+            exit 1
+          fi
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Verify provenance before reusing an existing registry version
+        if: steps.registry.outputs.exists == 'true'
+        run: |
+          set -euo pipefail
+          if ! gh attestation verify "oci://ghcr.io/dstoc/chime@$IMAGE_DIGEST" \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+            --source-digest "$SOURCE_SHA" \
+            --bundle-from-oci; then
+            {
+              echo "### Recovery required"
+              echo "GHCR already contains `$IMAGE_REF` at `$IMAGE_DIGEST`, but its expected release provenance did not verify. The workflow stopped without overwriting it. Review and recover this image outside the automated path."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+        env:
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+
+      - name: Attest the newly published image digest
+        if: steps.registry.outputs.exists == 'false'
+        uses: actions/attest@v4
+        with:
+          subject-name: ghcr.io/dstoc/chime
+          subject-digest: ${{ steps.image.outputs.digest }}
+          push-to-registry: true
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Attest the CLI archive
+        if: steps.cli_asset.outputs.reuse != 'true'
+        uses: actions/attest@v4
+        with:
+          subject-path: dist/${{ env.CLI_ARCHIVE }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify CLI and image provenance
+        env:
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          gh attestation verify "dist/$CLI_ARCHIVE" \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+            --source-digest "$SOURCE_SHA"
+          gh attestation verify "oci://ghcr.io/dstoc/chime@$IMAGE_DIGEST" \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+            --source-digest "$SOURCE_SHA" \
+            --bundle-from-oci
+
+      - name: Verify anonymous AMD64 pull and server response
+        env:
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+          RELEASE_ID: ${{ steps.release.outputs.release_id }}
+        run: |
+          set -euo pipefail
+          docker logout ghcr.io >/dev/null
+          docker image rm "$IMAGE_REF" >/dev/null 2>&1 || true
+          docker pull --platform linux/amd64 "$IMAGE_REF"
+          platform=$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$IMAGE_REF")
+          [[ "$platform" == "linux/amd64" ]]
+          repo_digests=$(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$IMAGE_REF")
+          grep -Fxq "ghcr.io/dstoc/chime@$IMAGE_DIGEST" <<< "$repo_digests"
+          image_by_digest="ghcr.io/dstoc/chime@$IMAGE_DIGEST"
+
+          state_dir=$(mktemp -d)
+          chmod 0777 "$state_dir"
+          container_name="chime-release-smoke-${GITHUB_RUN_ID}"
+          cleanup() {
+            docker rm --force "$container_name" >/dev/null 2>&1 || true
+            rm -rf "$state_dir"
+          }
+          trap cleanup EXIT
+          docker run --detach --rm \
+            --name "$container_name" \
+            --network host \
+            --read-only \
+            --tmpfs /tmp:rw,noexec,nosuid,size=16m \
+            --volume "$state_dir:/var/lib/chime:rw" \
+            "$image_by_digest" >/dev/null
+          served=false
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:8080/ --output "$RUNNER_TEMP/chime-index.html" 2>/dev/null; then
+              if grep -qi 'Chime' "$RUNNER_TEMP/chime-index.html"; then
+                served=true
+                break
+              fi
+            fi
+            sleep 2
+          done
+          if [[ "$served" != "true" ]]; then
+            echo "The anonymous AMD64 image pull succeeded, but the server did not serve the Chime UI" >&2
+            exit 1
+          fi
+
+      - name: Prepare image digest and checksum release assets
+        env:
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          archive_sha=$(sha256sum "dist/$CLI_ARCHIVE" | awk '{print $1}')
+          printf 'Image: %s\nDigest: %s\nSource commit: %s\n' \
+            "$IMAGE_REF" "$IMAGE_DIGEST" "$SOURCE_SHA" \
+            > "dist/chime-v${VERSION}-image-digest.txt"
+          printf '%s\n' "$archive_sha" > "$RUNNER_TEMP/cli-sha256.txt"
+
+      - name: Attach or reuse draft release assets without replacement
+        env:
+          RELEASE_ID: ${{ steps.release.outputs.release_id }}
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          assert_draft() {
+            local release_json
+            release_json=$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID")
+            jq -e --arg tag "$TAG" '.tag_name == $tag and .draft == true and .published_at == null' \
+              <<< "$release_json" >/dev/null || {
+                echo "Release $TAG is no longer the expected draft; refusing to edit or publish it" >&2
+                exit 1
+              }
+          }
+          ensure_asset() {
+            local path=$1
+            local name=${path##*/}
+            local assets matches count download_dir
+            assets=$(gh api --paginate --slurp \
+              "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?per_page=100")
+            matches=$(jq -c --arg name "$name" '[.[][] | select(.name == $name) | .id]' <<< "$assets")
+            count=$(jq 'length' <<< "$matches")
+            if [[ "$count" -eq 0 ]]; then
+              assert_draft
+              gh release upload "$TAG" "$path" --repo "$GITHUB_REPOSITORY"
+            elif [[ "$count" -ne 1 ]]; then
+              echo "Release has duplicate assets named $name; refusing to replace them" >&2
+              exit 1
+            fi
+            download_dir=$(mktemp -d)
+            gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --pattern "$name" --dir "$download_dir"
+            if ! cmp --silent "$path" "$download_dir/$name"; then
+              echo "Existing draft asset $name differs from the deterministic local artifact; refusing to replace it" >&2
+              rm -rf "$download_dir"
+              exit 1
+            fi
+            rm -rf "$download_dir"
+          }
+
+          assert_draft
+          ensure_asset "dist/$CLI_ARCHIVE"
+          ensure_asset "dist/$CLI_ARCHIVE.sha256"
+          ensure_asset "dist/chime-v${VERSION}-image-digest.txt"
+
+      - name: Update draft notes with verified artifact identities
+        env:
+          RELEASE_ID: ${{ steps.release.outputs.release_id }}
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" --jq .body \
+            > "$RUNNER_TEMP/release-body.md"
+          python3 - "$RUNNER_TEMP/release-body.md" "$RUNNER_TEMP/release-notes.md" <<'PY'
+          import os
+          import sys
+          from pathlib import Path
+
+          marker = "<!-- chime-verified-artifacts -->"
+          body = Path(sys.argv[1]).read_text().split(marker, 1)[0].rstrip()
+          version = os.environ["VERSION"]
+          image = os.environ["IMAGE_REF"]
+          digest = os.environ["IMAGE_DIGEST"]
+          source = os.environ["SOURCE_SHA"]
+          archive = os.environ["CLI_ARCHIVE"]
+          cli_sha = Path(os.environ["RUNNER_TEMP"], "cli-sha256.txt").read_text().strip()
+          block = f"""{marker}
+          ## Verified release artifacts
+
+          - Source commit: `{source}`
+          - Container image: `{image}`
+          - OCI digest: `{digest}`
+          - Digest-pinned image: `ghcr.io/dstoc/chime@{digest}`
+          - CLI archive: `{archive}`
+          - CLI SHA-256: `{cli_sha}`
+          - Verify both attestations with the commands in [the release guide](https://github.com/dstoc/chime/blob/v{version}/docs/releases.md).
+          """.strip()
+          Path(sys.argv[2]).write_text((body + "\n\n" if body else "") + block + "\n")
+          PY
+          release_json=$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID")
+          jq -e --arg tag "$TAG" '.tag_name == $tag and .draft == true' <<< "$release_json" >/dev/null
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --notes-file "$RUNNER_TEMP/release-notes.md"
+
+      - name: Publish the complete verified release
+        env:
+          RELEASE_ID: ${{ steps.release.outputs.release_id }}
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          release_json=$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID")
+          jq -e --arg tag "$TAG" '.tag_name == $tag and .draft == true and .published_at == null' \
+            <<< "$release_json" >/dev/null || {
+              echo "Release $TAG is not the expected draft; refusing to publish" >&2
+              exit 1
+            }
+          {
+            echo "## Published Chime release $TAG"
+            echo
+            echo "- Source: `$SOURCE_SHA`"
+            echo "- Image: `$IMAGE_REF`"
+            echo "- OCI digest: `$IMAGE_DIGEST`"
+            echo "- CLI: `$CLI_ARCHIVE`"
+            echo "- CLI SHA-256: `$(cat "$RUNNER_TEMP/cli-sha256.txt")`"
+            echo "- The GHCR image was pulled without registry credentials and its server UI responded in the Linux AMD64 runner."
+          } >> "$GITHUB_STEP_SUMMARY"
+          gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
+            --field draft=false >/dev/null
