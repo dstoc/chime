@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 pub struct NotificationRequest {
     pub title: String,
     pub body: Option<String>,
+    pub image_url: Option<String>,
+    pub url: Option<String>,
 }
 
 /// Versioned push payload shown by the browser service worker.
@@ -18,6 +20,8 @@ pub struct NotificationPayload {
     pub id: String,
     pub title: String,
     pub body: Option<String>,
+    pub image_url: Option<String>,
+    pub url: Option<String>,
     pub expires_at: i64,
     pub ack_capability: String,
 }
@@ -58,6 +62,8 @@ mod tests {
             NotificationRequest {
                 title: "Build completed".into(),
                 body: None,
+                image_url: None,
+                url: None,
             }
         );
     }

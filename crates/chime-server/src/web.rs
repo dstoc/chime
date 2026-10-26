@@ -2,11 +2,12 @@ use crate::admin::{
     AddFinishRequest, AdminError, AdminFinishRequest, AdminRequest, AdminResponse, AdminState,
     SetupFinishRequest, SetupStartRequest,
 };
+use crate::images::{ImageError, ImageStore, ImageType, MAX_IMAGE_BYTES};
 use crate::notify::NotifyState;
 use axum::{
     Router,
-    body::Body,
-    extract::{DefaultBodyLimit, FromRequest, Path, State},
+    body::{Body, to_bytes},
+    extract::{DefaultBodyLimit, FromRequest, Multipart, Path, State},
     http::{HeaderName, HeaderValue, Request, StatusCode, Uri, header},
     middleware::{self, Next},
     response::Response,
@@ -15,24 +16,34 @@ use axum::{
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use include_dir::{Dir, include_dir};
 use serde::Serialize;
+use std::collections::HashSet;
 
 static WEB_ASSETS: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../../web");
 
-const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; base-uri 'none'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; manifest-src 'self'; img-src 'self'; script-src 'self'; style-src 'self'";
+const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; base-uri 'none'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; manifest-src 'self'; img-src 'self' https:; script-src 'self'; style-src 'self'";
 const MAX_JSON_BODY_BYTES: usize = 16 * 1024;
+const MAX_MULTIPART_BODY_BYTES: usize = MAX_IMAGE_BYTES + MAX_JSON_BODY_BYTES;
+const MAX_TEXT_PART_BYTES: usize = 2048;
 
 #[derive(Clone)]
 struct AppState {
     admin: AdminState,
     notify: NotifyState,
+    images: ImageStore,
 }
 
-pub fn router(admin: AdminState, notifications: NotifyState) -> Router {
+pub fn router(admin: AdminState, notifications: NotifyState, images: ImageStore) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/api/setup/status", get(setup_status))
         .route("/api/push-key", get(push_key))
-        .route("/api/notify", post(notify))
+        .route(
+            "/api/notify",
+            post(notify)
+                .options(notify_options)
+                .layer(DefaultBodyLimit::max(MAX_MULTIPART_BODY_BYTES)),
+        )
+        .route("/api/images/{capability}", get(image))
         .route("/api/setup/start", post(setup_start))
         .route("/api/setup/finish", post(setup_finish))
         .route("/api/admin/challenge", post(admin_challenge))
@@ -43,6 +54,7 @@ pub fn router(admin: AdminState, notifications: NotifyState) -> Router {
         .with_state(AppState {
             admin,
             notify: notifications,
+            images,
         })
         .layer(DefaultBodyLimit::max(MAX_JSON_BODY_BYTES))
         .layer(middleware::from_fn(security_headers))
@@ -82,20 +94,215 @@ async fn push_key(State(state): State<AppState>) -> Response {
 }
 
 async fn notify(State(state): State<AppState>, request: Request<Body>) -> Response {
+    with_notify_cors(handle_notify(state, request).await)
+}
+
+async fn handle_notify(state: AppState, request: Request<Body>) -> Response {
     let Some(secret) = bearer_secret(&request) else {
         return error_response(
             StatusCode::UNAUTHORIZED,
             "A valid Chime send key is required.",
         );
     };
-    let body = match parse_json::<chime_protocol::NotificationRequest>(request).await {
-        Ok(body) => body,
+    let authorized = match state.notify.authorize(secret).await {
+        Ok(authorized) => authorized,
+        Err(error) => return error_response(error.status, error.message),
+    };
+    let content_type = request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    let parsed = if media_type(content_type) == Some("application/json") {
+        parse_json_limited::<chime_protocol::NotificationRequest>(request, MAX_JSON_BODY_BYTES)
+            .await
+            .map(|body| (body, None))
+    } else if media_type(content_type) == Some("multipart/form-data") {
+        parse_multipart(request).await
+    } else {
+        return error_response(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "Use JSON or multipart form data.",
+        );
+    };
+    let (mut body, upload) = match parsed {
+        Ok(parsed) => parsed,
         Err(status) => return error_response(status, "The request body is invalid."),
     };
-    match state.notify.send(secret, body).await {
+    if upload.is_some() && body.image_url.is_some() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "Use an uploaded image or image_url, not both.",
+        );
+    }
+
+    let capability = match upload.as_ref() {
+        Some(_) => match state.images.capability(state.admin.expected_origin()) {
+            Ok(capability) => Some(capability),
+            Err(error) => return error_response(error.status, error.message),
+        },
+        None => None,
+    };
+    if let Some(capability) = &capability {
+        body.image_url = Some(capability.url.clone());
+    }
+    let plan = match state.notify.prepare(authorized, body) {
+        Ok(plan) => plan,
+        Err(error) => return error_response(error.status, error.message),
+    };
+
+    if let (Some((image_type, bytes)), Some(capability)) = (upload, capability)
+        && matches!(&plan, crate::notify::SendPlan::Ready(_))
+        && let Err(error) = state.images.save(&capability, image_type, bytes).await
+    {
+        return image_error(error);
+    }
+    match state.notify.dispatch(plan).await {
         Ok(summary) => api_json(StatusCode::OK, summary),
         Err(error) => error_response(error.status, error.message),
     }
+}
+
+async fn notify_options() -> Response {
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = StatusCode::NO_CONTENT;
+    with_notify_cors(response)
+}
+
+async fn image(Path(capability): Path<String>, State(state): State<AppState>) -> Response {
+    match state.images.load(capability).await {
+        Ok(Some((bytes, content_type))) => {
+            let mut response = Response::new(Body::from(bytes));
+            response
+                .headers_mut()
+                .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+            response
+        }
+        Ok(None) => error_response(StatusCode::NOT_FOUND, "Not found."),
+        Err(_) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Chime could not load this image.",
+        ),
+    }
+}
+
+fn image_error(error: ImageError) -> Response {
+    error_response(error.status, error.message)
+}
+
+fn with_notify_cors(mut response: Response) -> Response {
+    let headers = response.headers_mut();
+    headers.insert(
+        HeaderName::from_static("access-control-allow-origin"),
+        HeaderValue::from_static("*"),
+    );
+    headers.insert(
+        HeaderName::from_static("access-control-allow-methods"),
+        HeaderValue::from_static("POST, OPTIONS"),
+    );
+    headers.insert(
+        HeaderName::from_static("access-control-allow-headers"),
+        HeaderValue::from_static("Authorization, Content-Type"),
+    );
+    response
+}
+
+fn media_type(value: &str) -> Option<&str> {
+    value.split(';').next().map(str::trim)
+}
+
+struct UploadedImage {
+    image_type: ImageType,
+    bytes: Vec<u8>,
+}
+
+async fn parse_multipart(
+    request: Request<Body>,
+) -> Result<
+    (
+        chime_protocol::NotificationRequest,
+        Option<(ImageType, Vec<u8>)>,
+    ),
+    StatusCode,
+> {
+    let mut multipart = Multipart::from_request(request, &())
+        .await
+        .map_err(|rejection| rejection.status())?;
+    let mut seen = HashSet::new();
+    let mut title = None;
+    let mut body = None;
+    let mut image_url = None;
+    let mut url = None;
+    let mut upload = None;
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|_| StatusCode::BAD_REQUEST)?
+    {
+        let name = field.name().ok_or(StatusCode::BAD_REQUEST)?.to_owned();
+        if !seen.insert(name.clone()) {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        let filename = field.file_name().map(str::to_owned);
+        if name == "image" {
+            let filename = filename.ok_or(StatusCode::BAD_REQUEST)?;
+            if filename.is_empty()
+                || filename == "."
+                || filename == ".."
+                || filename.contains('/')
+                || filename.contains('\\')
+            {
+                return Err(StatusCode::BAD_REQUEST);
+            }
+            let content_type = field.content_type().ok_or(StatusCode::BAD_REQUEST)?;
+            let image_type = ImageType::parse(content_type.split(';').next().unwrap_or_default())
+                .ok_or(StatusCode::BAD_REQUEST)?;
+            let mut bytes = Vec::new();
+            let mut field = field;
+            while let Some(chunk) = field.chunk().await.map_err(|_| StatusCode::BAD_REQUEST)? {
+                if bytes.len().saturating_add(chunk.len()) > MAX_IMAGE_BYTES {
+                    return Err(StatusCode::PAYLOAD_TOO_LARGE);
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            if !crate::images::validate_upload(&bytes, image_type) {
+                return Err(StatusCode::BAD_REQUEST);
+            }
+            upload = Some(UploadedImage { image_type, bytes });
+            continue;
+        }
+        if filename.is_some() {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        if !matches!(name.as_str(), "title" | "body" | "image_url" | "url") {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        let mut bytes = Vec::new();
+        let mut field = field;
+        while let Some(chunk) = field.chunk().await.map_err(|_| StatusCode::BAD_REQUEST)? {
+            if bytes.len().saturating_add(chunk.len()) > MAX_TEXT_PART_BYTES {
+                return Err(StatusCode::PAYLOAD_TOO_LARGE);
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let value = String::from_utf8(bytes).map_err(|_| StatusCode::BAD_REQUEST)?;
+        match name.as_str() {
+            "title" => title = Some(value),
+            "body" => body = Some(value),
+            "image_url" => image_url = Some(value),
+            "url" => url = Some(value),
+            _ => return Err(StatusCode::BAD_REQUEST),
+        }
+    }
+    let title = title.ok_or(StatusCode::BAD_REQUEST)?;
+    let request = chime_protocol::NotificationRequest {
+        title,
+        body,
+        image_url,
+        url,
+    };
+    let upload = upload.map(|image| (image.image_type, image.bytes));
+    Ok((request, upload))
 }
 
 async fn setup_start(State(state): State<AppState>, request: Request<Body>) -> Response {
@@ -192,6 +399,17 @@ where
     }
 }
 
+async fn parse_json_limited<T>(request: Request<Body>, limit: usize) -> Result<T, StatusCode>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let (_, body) = request.into_parts();
+    let bytes = to_bytes(body, limit)
+        .await
+        .map_err(|_| StatusCode::PAYLOAD_TOO_LARGE)?;
+    serde_json::from_slice(&bytes).map_err(|_| StatusCode::BAD_REQUEST)
+}
+
 fn origin_matches(request: &Request<Body>, state: &AdminState) -> bool {
     request
         .headers()
@@ -264,10 +482,11 @@ fn error_response(status: StatusCode, message: &'static str) -> Response {
 }
 
 async fn security_headers(request: Request<Body>, next: Next) -> Response {
-    secure_response(next.run(request).await)
+    let public_image = request.uri().path().starts_with("/api/images/");
+    secure_response(next.run(request).await, public_image)
 }
 
-fn secure_response(mut response: Response) -> Response {
+fn secure_response(mut response: Response, public_image: bool) -> Response {
     let headers = response.headers_mut();
     headers.insert(
         header::CONTENT_SECURITY_POLICY,
@@ -285,40 +504,76 @@ fn secure_response(mut response: Response) -> Response {
     );
     headers.insert(
         HeaderName::from_static("cross-origin-resource-policy"),
-        HeaderValue::from_static("same-origin"),
+        HeaderValue::from_static(if public_image {
+            "cross-origin"
+        } else {
+            "same-origin"
+        }),
     );
     response
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{AdminState, CONTENT_SECURITY_POLICY, MAX_JSON_BODY_BYTES, StatusCode, router};
+    use super::{
+        AdminState, CONTENT_SECURITY_POLICY, MAX_IMAGE_BYTES, MAX_JSON_BODY_BYTES, StatusCode,
+        router,
+    };
+    use crate::images::ImageStore;
     use crate::notify::NotifyState;
     use crate::push::WebPushTransport;
     use crate::{config::Origin, store::Store};
     use axum::{body::Body, http::Request};
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    use sha2::{Digest, Sha256};
     use std::str::FromStr;
     use std::sync::Arc;
     use tower::ServiceExt;
 
-    async fn app() -> (axum::Router, tempfile::TempDir, String) {
+    async fn app() -> (
+        axum::Router,
+        tempfile::TempDir,
+        String,
+        String,
+        ImageStore,
+        Store,
+    ) {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(&directory.path().join("state")).unwrap();
         let code = store.initialize_setup_code().await.unwrap().unwrap();
+        let secret = format!("chime_sk_{}", URL_SAFE_NO_PAD.encode([9_u8; 32]));
+        let digest = Sha256::digest(secret.as_bytes()).to_vec();
+        store
+            .database()
+            .run(move |connection| {
+                connection.execute(
+                    "INSERT INTO send_keys (id, name, secret_digest, created_at)
+                     VALUES ('AAAAAAAAAAAAAAAAAAAAAA', 'browser sender', ?1, unixepoch())",
+                    rusqlite::params![digest],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
         let origin = Origin::from_str("https://chime.example-tailnet.ts.net").unwrap();
+        let images = ImageStore::new(store.clone()).unwrap();
         (
             router(
                 AdminState::new(store.clone(), &origin).unwrap(),
-                NotifyState::new(store, Arc::new(WebPushTransport::new().unwrap())),
+                NotifyState::new(store.clone(), Arc::new(WebPushTransport::new().unwrap())),
+                images.clone(),
             ),
             directory,
             code,
+            secret,
+            images,
+            store,
         )
     }
 
     #[tokio::test]
     async fn embedded_assets_have_types_and_security_headers() {
-        let (app, _directory, _code) = app().await;
+        let (app, _directory, _code, _secret, _images, _store) = app().await;
         let response = app
             .clone()
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
@@ -338,8 +593,10 @@ mod tests {
             CONTENT_SECURITY_POLICY
         );
         assert!(CONTENT_SECURITY_POLICY.contains("manifest-src 'self'"));
+        assert!(CONTENT_SECURITY_POLICY.contains("img-src 'self' https:"));
 
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/styles.css")
@@ -357,7 +614,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_assets_and_api_responses_are_not_cached() {
-        let (app, _directory, code) = app().await;
+        let (app, _directory, code, _secret, _images, _store) = app().await;
         let response = app
             .clone()
             .oneshot(
@@ -390,7 +647,7 @@ mod tests {
 
     #[tokio::test]
     async fn admin_posts_require_the_exact_configured_origin() {
-        let (app, _directory, _code) = app().await;
+        let (app, _directory, _code, _secret, _images, _store) = app().await;
         let response = app
             .clone()
             .oneshot(
@@ -419,5 +676,366 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(
+            !response
+                .headers()
+                .contains_key("access-control-allow-origin")
+        );
+    }
+
+    #[tokio::test]
+    async fn notify_cors_covers_preflight_and_authorized_and_unauthorized_responses_only() {
+        let (app, _directory, _code, secret, _images, _store) = app().await;
+        let preflight = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri("/api/notify")
+                    .header("origin", "https://sender.example")
+                    .header("access-control-request-method", "POST")
+                    .header(
+                        "access-control-request-headers",
+                        "authorization,content-type",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(preflight.status(), StatusCode::NO_CONTENT);
+        assert_eq!(preflight.headers()["access-control-allow-origin"], "*");
+        assert_eq!(
+            preflight.headers()["access-control-allow-methods"],
+            "POST, OPTIONS"
+        );
+        assert_eq!(
+            preflight.headers()["access-control-allow-headers"],
+            "Authorization, Content-Type"
+        );
+        assert!(
+            !preflight
+                .headers()
+                .contains_key("access-control-allow-credentials")
+        );
+
+        for (authorization, expected_status) in [
+            ("Bearer invalid".to_owned(), StatusCode::UNAUTHORIZED),
+            (format!("Bearer {secret}"), StatusCode::OK),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/notify")
+                        .header("origin", "https://sender.example")
+                        .header("authorization", authorization)
+                        .header("content-type", "application/json")
+                        .body(Body::from(r#"{"title":"Browser send"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected_status);
+            assert_eq!(response.headers()["access-control-allow-origin"], "*");
+            assert!(
+                !response
+                    .headers()
+                    .contains_key("access-control-allow-credentials")
+            );
+        }
+
+        let admin = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/setup/status")
+                    .header("origin", "https://sender.example")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(admin.status(), StatusCode::OK);
+        assert!(!admin.headers().contains_key("access-control-allow-origin"));
+    }
+
+    #[tokio::test]
+    async fn multipart_rejects_bad_fields_images_and_filenames_before_storage() {
+        let (app, directory, _code, secret, _images, store) = app().await;
+        let boundary = "chime-test-boundary";
+        let png = b"\x89PNG\r\n\x1a\nsmall png";
+        let bad_requests = [
+            multipart_body(boundary, &[("title", b"First"), ("title", b"Second")], None),
+            multipart_body(boundary, &[("title", b"Known"), ("unknown", b"x")], None),
+            multipart_body(
+                boundary,
+                &[("title", b"Traversal")],
+                Some(("../../escape.png", "image/png", png)),
+            ),
+            multipart_body(
+                boundary,
+                &[("title", b"Spoof")],
+                Some(("image.png", "image/jpeg", png)),
+            ),
+            multipart_body(
+                boundary,
+                &[("title", b"Unsupported")],
+                Some(("image.svg", "image/svg+xml", b"<svg/>")),
+            ),
+            multipart_body(
+                boundary,
+                &[
+                    ("title", b"Conflict"),
+                    ("image_url", b"https://images.example/a.png"),
+                ],
+                Some(("image.png", "image/png", png)),
+            ),
+        ];
+        for body in bad_requests {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/notify")
+                        .header("authorization", format!("Bearer {secret}"))
+                        .header(
+                            "content-type",
+                            format!("multipart/form-data; boundary={boundary}"),
+                        )
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(response.headers()["access-control-allow-origin"], "*");
+        }
+
+        let mut oversized_image = vec![b'x'; MAX_IMAGE_BYTES + 1];
+        oversized_image[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+        let overflow = multipart_body(
+            boundary,
+            &[("title", b"Overflow")],
+            Some(("large.png", "image/png", &oversized_image)),
+        );
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/notify")
+                    .header("authorization", format!("Bearer {secret}"))
+                    .header(
+                        "content-type",
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(overflow))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        let unauthorized_upload = multipart_body(
+            boundary,
+            &[("title", b"Unauthorized")],
+            Some(("image.png", "image/png", png)),
+        );
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/notify")
+                    .header("authorization", "Bearer invalid")
+                    .header(
+                        "content-type",
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(unauthorized_upload))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.headers()["access-control-allow-origin"], "*");
+
+        let upload_body = multipart_body(
+            boundary,
+            &[("title", b"Upload"), ("url", b"https://example.com/result")],
+            Some(("render.png", "image/png", png)),
+        );
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/notify")
+                    .header("authorization", format!("Bearer {secret}"))
+                    .header(
+                        "content-type",
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(upload_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["access-control-allow-origin"], "*");
+        let image_count = store
+            .database()
+            .run(|connection| {
+                connection.query_row("SELECT COUNT(*) FROM uploaded_images", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(image_count, 0);
+        assert_eq!(
+            std::fs::read_dir(directory.path().join("state/images"))
+                .unwrap()
+                .count(),
+            0
+        );
+
+        for (body, status) in [
+            (
+                r#"{"title":"A","title":"B"}"#.to_owned(),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                r#"{"title":"A","other":true}"#.to_owned(),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                format!(
+                    "{{\"title\":\"Hello\",\"image_url\":\"https://images.example/{}\",\"url\":\"https://example.com/{}\"}}",
+                    "a".repeat(1800),
+                    "b".repeat(1000)
+                ),
+                StatusCode::BAD_REQUEST,
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/notify")
+                        .header("authorization", format!("Bearer {secret}"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status);
+        }
+        let oversized_json = format!("{{\"title\":\"{}\"}}", "x".repeat(MAX_JSON_BODY_BYTES));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/notify")
+                    .header("authorization", format!("Bearer {secret}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(oversized_json))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn image_capability_has_fixed_headers_and_expired_urls_return_not_found() {
+        let (app, _directory, _code, _secret, images, store) = app().await;
+        let capability = images
+            .capability("https://chime.example-tailnet.ts.net")
+            .unwrap();
+        images
+            .save(
+                &capability,
+                crate::images::ImageType::Png,
+                b"\x89PNG\r\n\x1a\nimage fixture".to_vec(),
+            )
+            .await
+            .unwrap();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/images/{}", capability.token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "image/png");
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+        assert_eq!(
+            response.headers()["cross-origin-resource-policy"],
+            "cross-origin"
+        );
+        assert!(
+            !response
+                .headers()
+                .contains_key("access-control-allow-origin")
+        );
+
+        let token = capability.token.clone();
+        store
+            .database()
+            .run(move |connection| {
+                connection.execute(
+                    "UPDATE uploaded_images SET expires_at = unixepoch() - 1 WHERE capability = ?1",
+                    [token],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/images/{}", capability.token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    fn multipart_body(
+        boundary: &str,
+        fields: &[(&str, &[u8])],
+        image: Option<(&str, &str, &[u8])>,
+    ) -> Vec<u8> {
+        let mut body = Vec::new();
+        for (name, value) in fields {
+            body.extend_from_slice(
+                format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n")
+                    .as_bytes(),
+            );
+            body.extend_from_slice(value);
+            body.extend_from_slice(b"\r\n");
+        }
+        if let Some((filename, content_type, bytes)) = image {
+            body.extend_from_slice(
+                format!("--{boundary}\r\nContent-Disposition: form-data; name=\"image\"; filename=\"{filename}\"\r\nContent-Type: {content_type}\r\n\r\n").as_bytes(),
+            );
+            body.extend_from_slice(bytes);
+            body.extend_from_slice(b"\r\n");
+        }
+        body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+        body
     }
 }

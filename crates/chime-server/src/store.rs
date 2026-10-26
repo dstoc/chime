@@ -17,7 +17,7 @@ use webauthn_rs::prelude::{AuthenticationResult, Passkey};
 
 const DATABASE_FILE: &str = "chime.sqlite3";
 const DATABASE_CONCURRENCY: usize = 4;
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 const SETUP_CODE_LIFETIME_SECONDS: i64 = 15 * 60;
 const MAX_ADMIN_PASSKEYS: usize = 16;
 const MAX_SEND_KEYS: usize = 128;
@@ -63,6 +63,14 @@ impl Store {
     #[allow(dead_code)]
     pub fn database(&self) -> &Database {
         &self.database
+    }
+
+    pub fn image_directory(&self) -> PathBuf {
+        self.database
+            .path
+            .parent()
+            .expect("database path always has a parent")
+            .join("images")
     }
 
     #[allow(dead_code)]
@@ -726,6 +734,7 @@ fn initialize_schema(connection: &mut Connection) -> Result<()> {
             }
             1 => apply_migration_two(&transaction)?,
             2 => apply_migration_three(&transaction)?,
+            3 => apply_migration_four(&transaction)?,
             version => bail!("no database migration is available after version {version}"),
         }
         transaction.commit()?;
@@ -781,6 +790,20 @@ fn apply_migration_three(transaction: &Transaction<'_>) -> Result<()> {
         );
         CREATE INDEX send_keys_active_idx ON send_keys (revoked_at);
         INSERT INTO schema_migrations (version, applied_at) VALUES (3, unixepoch());",
+    )?;
+    Ok(())
+}
+
+fn apply_migration_four(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        "CREATE TABLE uploaded_images (
+            capability TEXT PRIMARY KEY CHECK (length(capability) = 43),
+            content_type TEXT NOT NULL CHECK (content_type IN ('image/png', 'image/jpeg', 'image/webp')),
+            byte_length INTEGER NOT NULL CHECK (byte_length BETWEEN 1 AND 5242880),
+            expires_at INTEGER NOT NULL
+        );
+        CREATE INDEX uploaded_images_expiry_idx ON uploaded_images (expires_at);
+        INSERT INTO schema_migrations (version, applied_at) VALUES (4, unixepoch());",
     )?;
     Ok(())
 }
@@ -1065,7 +1088,7 @@ mod tests {
                 })
             })
             .await?;
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
         Ok(())
     }
 
