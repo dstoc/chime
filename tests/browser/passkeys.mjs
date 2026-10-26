@@ -546,12 +546,66 @@ const acknowledgementBrowserChecks = await evaluate(`(async () => {
     controller.close();
   } });
   await acknowledgements.readEvents(unknownEvent, eventRegistration);
+  let oversizedCancelled = false;
   const oversized = new ReadableStream({ start(controller) {
     controller.enqueue(new Uint8Array(5000).fill(65));
-    controller.close();
+  }, cancel() {
+    oversizedCancelled = true;
   } });
   let oversizedRejected = false;
   try { await acknowledgements.readEvents(oversized, eventRegistration); } catch { oversizedRejected = true; }
+
+  const tokens = await import('/device-token.js');
+  await tokens.saveDeviceCredentials('fixture-device', 'chime_dt_fixture');
+  const serviceWorkerContainer = navigator.serviceWorker;
+  const originalGetRegistration = serviceWorkerContainer.getRegistration;
+  const originalSyncFetch = window.fetch;
+  let eventStreams = 0;
+  let streamCancellations = 0;
+  let firstAttemptReleasedBeforeRetry = false;
+  let reconciliationAttempts = 0;
+  let resolveHealthyReconciliation;
+  const healthyReconciliation = new Promise(resolve => { resolveHealthyReconciliation = resolve; });
+  const syncRegistration = {
+    getNotifications: async () => [{ data: { id: 'D'.repeat(22) } }],
+  };
+  try {
+    serviceWorkerContainer.getRegistration = async () => syncRegistration;
+    window.fetch = async (url) => {
+      if (String(url) === '/api/device/events') {
+        eventStreams += 1;
+        if (eventStreams === 2) firstAttemptReleasedBeforeRetry = streamCancellations === 1;
+        return {
+          status: 200,
+          ok: true,
+          body: new ReadableStream({ cancel() { streamCancellations += 1; } }),
+        };
+      }
+      reconciliationAttempts += 1;
+      if (reconciliationAttempts === 1) return { ok: false };
+      resolveHealthyReconciliation();
+      return { ok: true, json: async () => ({ acknowledged: [] }) };
+    };
+    acknowledgements.startAcknowledgementSync();
+    let retryTimer;
+    try {
+      await Promise.race([
+        healthyReconciliation,
+        new Promise((_, reject) => { retryTimer = setTimeout(() => reject(new Error('acknowledgement sync did not recover')), 5000); }),
+      ]);
+    } finally {
+      clearTimeout(retryTimer);
+    }
+    acknowledgements.stopAcknowledgementSync();
+    for (let attempt = 0; attempt < 50 && streamCancellations < 2; attempt += 1) {
+      await new Promise(resolve => setTimeout(resolve, 20));
+    }
+  } finally {
+    acknowledgements.stopAcknowledgementSync();
+    window.fetch = originalSyncFetch;
+    serviceWorkerContainer.getRegistration = originalGetRegistration;
+    await tokens.clearDeviceCredentials();
+  }
   return {
     batchSizes: batches,
     batchLimit: batches.every(size => size <= 100),
@@ -560,6 +614,10 @@ const acknowledgementBrowserChecks = await evaluate(`(async () => {
     tokenWasHeader: authorizationHeader === 'Bearer chime_dt_fixture',
     splitSseClosed: eventClosed.length === 1,
     oversizedRejected,
+    oversizedCancelled,
+    reconciliationRecovered: eventStreams === 2 && reconciliationAttempts === 2,
+    firstAttemptReleasedBeforeRetry,
+    failedAttemptCancelled: streamCancellations === 2,
   };
 })()`);
 if (acknowledgementBrowserChecks.batchSizes.join('/') !== '100/100/5'
@@ -568,7 +626,11 @@ if (acknowledgementBrowserChecks.batchSizes.join('/') !== '100/100/5'
   || !acknowledgementBrowserChecks.tokenStayedOutOfUrl
   || !acknowledgementBrowserChecks.tokenWasHeader
   || !acknowledgementBrowserChecks.splitSseClosed
-  || !acknowledgementBrowserChecks.oversizedRejected) {
+  || !acknowledgementBrowserChecks.oversizedRejected
+  || !acknowledgementBrowserChecks.oversizedCancelled
+  || !acknowledgementBrowserChecks.reconciliationRecovered
+  || !acknowledgementBrowserChecks.firstAttemptReleasedBeforeRetry
+  || !acknowledgementBrowserChecks.failedAttemptCancelled) {
   throw new Error(`browser acknowledgement checks failed: ${JSON.stringify(acknowledgementBrowserChecks)}`);
 }
 await cdp('ServiceWorker.enable');

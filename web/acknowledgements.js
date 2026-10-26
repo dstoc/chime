@@ -26,6 +26,7 @@ async function synchronize(signal) {
   while (!signal.aborted) {
     const credentials = await getDeviceCredentials().catch(() => null);
     if (!credentials?.token) return;
+    let eventBody;
     try {
       const registration = await navigator.serviceWorker.getRegistration("/");
       if (!registration) return;
@@ -35,13 +36,22 @@ async function synchronize(signal) {
         credentials: "same-origin",
         signal,
       });
+      eventBody = response.body;
       if (response.status === 401 || response.status === 403) return;
-      if (!response.ok || !response.body) throw new Error("The event stream is unavailable.");
+      if (!response.ok || !eventBody) throw new Error("The event stream is unavailable.");
       retryMs = MIN_RETRY_MS;
       await reconcileVisible(registration, credentials.token, signal);
-      await readEvents(response.body, registration, signal);
+      await readEvents(eventBody, registration, signal);
     } catch {
       if (signal.aborted) return;
+    } finally {
+      if (eventBody) {
+        try {
+          await eventBody.cancel();
+        } catch {
+          // The event reader may already have cancelled the stream.
+        }
+      }
     }
     await delay(retryMs, signal);
     retryMs = Math.min(retryMs * 2, MAX_RETRY_MS);
@@ -79,10 +89,16 @@ export async function readEvents(body, registration, signal = new AbortControlle
   const reader = body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  let complete = false;
+  const cancelOnAbort = () => { void reader.cancel().catch(() => {}); };
+  signal.addEventListener("abort", cancelOnAbort, { once: true });
   try {
     while (!signal.aborted) {
       const { done, value } = await reader.read();
-      if (done) return;
+      if (done) {
+        complete = true;
+        return;
+      }
       buffer += decoder.decode(value, { stream: true });
       if (new TextEncoder().encode(buffer).length > MAX_EVENT_BUFFER) {
         throw new Error("The event stream buffer limit was exceeded.");
@@ -95,6 +111,14 @@ export async function readEvents(body, registration, signal = new AbortControlle
       }
     }
   } finally {
+    signal.removeEventListener("abort", cancelOnAbort);
+    if (!complete) {
+      try {
+        await reader.cancel();
+      } catch {
+        // The stream may have failed while it was being read.
+      }
+    }
     reader.releaseLock();
   }
 }
