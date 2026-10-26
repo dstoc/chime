@@ -1,0 +1,23 @@
+[Unit]
+Description=Tailscale Serve sidecar for Chime
+
+[Container]
+Image=docker.io/tailscale/tailscale:v1.102.4
+ContainerName=chime-tailscale
+Pod=chime.pod
+StartWithPod=true
+Environment=TS_HOSTNAME=chime
+Environment=TS_USERSPACE=true
+Environment=TS_STATE_DIR=/var/lib/tailscale
+Environment=TS_AUTH_ONCE=true
+Environment=TS_AUTHKEY=file:/run/secrets/tailscale-authkey
+Environment=TS_SERVE_CONFIG=/config/serve.json
+Secret=tailscale-authkey,type=mount,target=tailscale-authkey
+Volume=%h/.local/share/chime/tailscale:/var/lib/tailscale:rw,Z
+Volume=%h/.config/chime/tailscale:/config:ro,Z
+
+[Service]
+Restart=always
+
+[Install]
+WantedBy=default.target

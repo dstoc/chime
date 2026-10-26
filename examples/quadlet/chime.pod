@@ -1,0 +1,11 @@
+[Unit]
+Description=Chime server and Tailscale sidecar pod
+
+[Pod]
+PodName=chime
+
+[Service]
+Restart=always
+
+[Install]
+WantedBy=default.target

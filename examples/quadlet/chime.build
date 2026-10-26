@@ -1,0 +1,10 @@
+[Unit]
+Description=Build the Chime server image from the local checkout
+
+[Build]
+ImageTag=localhost/chime:0.1.0
+File=%h/src/chime/Containerfile
+SetWorkingDirectory=%h/src/chime
+
+[Service]
+TimeoutStartSec=900
