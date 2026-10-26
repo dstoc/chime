@@ -514,9 +514,19 @@ jobs:
             count=$(jq 'length' <<< "$matches")
             if [[ "$count" -eq 0 ]]; then
               assert_draft
-              gh api --method POST --hostname uploads.github.com \
-                "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?name=$name" \
-                -H "Content-Type: application/octet-stream" --input "$path" >/dev/null
+              # Release assets use a separate upload host from the REST API.
+              encoded_name=$(jq -nr --arg name "$name" '$name | @uri')
+              upload_response=$(curl --fail-with-body --silent --show-error \
+                --request POST \
+                --header "Authorization: Bearer $GH_TOKEN" \
+                --header "Accept: application/vnd.github+json" \
+                --header "X-GitHub-Api-Version: 2022-11-28" \
+                --header "Content-Type: application/octet-stream" \
+                --data-binary "@$path" \
+                "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?name=$encoded_name")
+              jq -e --arg name "$name" '
+                .name == $name and .state == "uploaded" and (.id | type == "number")
+              ' <<< "$upload_response" >/dev/null
             elif [[ "$count" -ne 1 ]]; then
               echo "Release has duplicate assets named $name; refusing to replace them" >&2
               exit 1

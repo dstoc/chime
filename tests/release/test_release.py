@@ -138,6 +138,61 @@ class ReleaseConfigurationTests(unittest.TestCase):
             workflow.index("Export release outputs"),
         )
 
+    def test_release_asset_upload_uses_github_upload_host(self) -> None:
+        script = workflow_run_script("Attach or reuse draft release assets without replacement")
+        self.assertNotIn("--hostname uploads.github.com", script)
+        self.assertNotIn("api.uploads.github.com", script.split("encoded_name=", 1)[1])
+        self.assertIn('"https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?name=$encoded_name"', script)
+        self.assertIn('--data-binary "@$path"', script)
+        self.assertIn('--header "Authorization: Bearer $GH_TOKEN"', script)
+        self.assertIn('curl --fail-with-body --silent --show-error', script)
+        self.assertIn('.name == $name and .state == "uploaded"', script)
+
+        # Exercise the actual upload snippet with a mock HTTP client. Assert
+        # that it carries the full asset bytes, token, and encoded name.
+        snippet = script.split('encoded_name=$(jq -nr', 1)[1]
+        snippet = 'encoded_name=$(jq -nr' + snippet.split("\n  elif [[", 1)[0]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            asset = root / "asset name.tar.gz"
+            asset.write_bytes(bytes([0, 255]) + b"archive" + bytes([0]))
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            log = root / "curl-args"
+            (fake_bin / "curl").write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, os, sys\n"
+                "from pathlib import Path\n"
+                "args = sys.argv[1:]\n"
+                "Path(os.environ['MOCK_CURL_LOG']).write_text(json.dumps(args))\n"
+                "path = args[args.index('--data-binary')+1][1:]\n"
+                "assert Path(path).read_bytes() == bytes([0, 255]) + b'archive' + bytes([0])\n"
+                "print(json.dumps({'name': Path(path).name, 'state': 'uploaded', 'id': 123}))\n"
+            )
+            (fake_bin / "curl").chmod(0o755)
+            env = os.environ.copy()
+            env.update(
+                PATH=f"{fake_bin}:{env['PATH']}",
+                GH_TOKEN="test-token",
+                GITHUB_REPOSITORY="dstoc/chime",
+                RELEASE_ID="42",
+                MOCK_CURL_LOG=str(log),
+            )
+            result = subprocess.run(
+                ["bash", "-euo", "pipefail", "-c", snippet],
+                cwd=root,
+                env={**env, "path": str(asset), "name": asset.name},
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            args = json.loads(log.read_text())
+            self.assertIn(
+                "https://uploads.github.com/repos/dstoc/chime/releases/42/assets?name=asset%20name.tar.gz",
+                args,
+            )
+            self.assertIn("Authorization: Bearer test-token", args)
+
     def test_draft_release_lookup_rejects_missing_or_published_releases(self) -> None:
         script = workflow_run_script("Verify draft, source, and shared workspace version")
         self.assertIn("releases?per_page=100", script)
