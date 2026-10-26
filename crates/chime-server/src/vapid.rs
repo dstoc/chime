@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use p256::SecretKey;
+use p256::{SecretKey, elliptic_curve::Generate};
 use web_push::VapidSignatureBuilder;
 
 pub struct VapidIdentity {
@@ -22,7 +22,10 @@ impl VapidIdentity {
         if private_key.len() != 32 || public_key.len() != 65 {
             anyhow::bail!("web-push returned an invalid VAPID key pair");
         }
-        Ok(Self { private_key, public_key })
+        Ok(Self {
+            private_key,
+            public_key,
+        })
     }
 
     pub fn private_key_bytes(&self) -> &[u8] {
