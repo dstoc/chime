@@ -151,11 +151,11 @@ class ReleaseConfigurationTests(unittest.TestCase):
         # Exercise the actual upload snippet with a mock HTTP client. Assert
         # that it carries the full asset bytes, token, and encoded name.
         snippet = script.split('encoded_name=$(jq -nr', 1)[1]
-        snippet = 'encoded_name=$(jq -nr' + snippet.split('\\n            elif [[', 1)[0]
+        snippet = 'encoded_name=$(jq -nr' + snippet.split("\\n  elif [[", 1)[0]
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             asset = root / "asset name.tar.gz"
-            asset.write_bytes(b"\\x00\\xffarchive\\x00")
+            asset.write_bytes(bytes([0, 255]) + b"archive" + bytes([0]))
             fake_bin = root / "bin"
             fake_bin.mkdir()
             log = root / "curl-args"
@@ -166,7 +166,7 @@ class ReleaseConfigurationTests(unittest.TestCase):
                 "args = sys.argv[1:]\\n"
                 "Path(os.environ['MOCK_CURL_LOG']).write_text(json.dumps(args))\\n"
                 "path = args[args.index('--data-binary')+1][1:]\\n"
-                "assert Path(path).read_bytes() == b'\\\\x00\\\\xffarchive\\\\x00'\\n"
+                "assert Path(path).read_bytes() == bytes([0, 255]) + b'archive' + bytes([0])\\n"
                 "print(json.dumps({'name': Path(path).name, 'state': 'uploaded', 'id': 123}))\\n"
             )
             (fake_bin / "curl").chmod(0o755)
