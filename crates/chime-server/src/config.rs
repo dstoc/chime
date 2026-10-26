@@ -30,6 +30,8 @@ impl Origin {
         &self.serialized
     }
 
+    // Used when the WebAuthn ceremony manager is added in the next milestone.
+    #[allow(dead_code)]
     pub fn rp_id(&self) -> &str {
         &self.rp_id
     }
@@ -149,15 +151,21 @@ mod tests {
 
     #[test]
     fn rejects_empty_or_non_directory_data_path() {
-        let args = Args::try_parse_from([
-            "chime-server",
-            "--origin",
-            "https://chime.example.ts.net",
-            "--data-dir",
-            "",
-        ])
-        .unwrap();
-        let mut config = Config::from(args);
+        assert!(
+            Args::try_parse_from([
+                "chime-server",
+                "--origin",
+                "https://chime.example.ts.net",
+                "--data-dir",
+                "",
+            ])
+            .is_err()
+        );
+
+        let mut config = Config {
+            origin: Origin::from_str("https://chime.example.ts.net").unwrap(),
+            data_dir: PathBuf::new(),
+        };
         assert!(config.validate().is_err());
 
         let file = tempfile::NamedTempFile::new().unwrap();

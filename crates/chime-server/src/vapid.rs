@@ -36,6 +36,8 @@ impl VapidIdentity {
         &self.public_key
     }
 
+    // Returned to enrolling devices when the push subscription flow is added.
+    #[allow(dead_code)]
     pub fn public_key_base64(&self) -> String {
         URL_SAFE_NO_PAD.encode(&self.public_key)
     }

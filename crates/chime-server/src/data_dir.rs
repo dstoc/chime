@@ -4,6 +4,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+
 const LOCK_FILE: &str = ".chime.lock";
 
 pub struct DataDirLock {

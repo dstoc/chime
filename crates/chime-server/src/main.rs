@@ -1,6 +1,9 @@
 mod config;
 mod data_dir;
+// The storage operations are established in this milestone and consumed by later server routes.
+#[allow(dead_code)]
 mod store;
+mod vapid;
 mod web;
 
 use anyhow::{Context, Result};
@@ -11,18 +14,17 @@ use std::net::SocketAddr;
 use store::Store;
 use tokio::net::TcpListener;
 
-const LISTEN_ADDRESS: SocketAddr = SocketAddr::from(([127, 0, 0, 1], 8080));
-
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = Config::checked(Args::parse())?;
     let _store = Store::open(&config.data_dir).context("initialize Chime state")?;
 
-    let listener = TcpListener::bind(LISTEN_ADDRESS)
+    let listen_address = SocketAddr::from(([127, 0, 0, 1], 8080));
+    let listener = TcpListener::bind(listen_address)
         .await
-        .with_context(|| format!("bind to {LISTEN_ADDRESS}"))?;
+        .with_context(|| format!("bind to {listen_address}"))?;
     eprintln!(
-        "Chime is listening on http://{LISTEN_ADDRESS}; configured HTTPS origin is {}",
+        "Chime is listening on http://{listen_address}; configured HTTPS origin is {}",
         config.origin.as_str()
     );
 

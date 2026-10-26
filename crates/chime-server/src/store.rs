@@ -236,8 +236,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn restart_keeps_vapid_identity_and_database_state() -> Result<()> {
+    #[tokio::test]
+    async fn restart_keeps_vapid_identity_and_database_state() -> Result<()> {
         let root = tempfile::tempdir()?;
         let path = root.path().join("state");
         let first = Store::open(&path)?;
