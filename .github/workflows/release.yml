@@ -253,8 +253,10 @@ jobs:
       - name: Run the CLI in a clean Debian runtime
         run: |
           set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/chime-cli-runtime"
+          tar -xzf "dist/$CLI_ARCHIVE" -C "$RUNNER_TEMP/chime-cli-runtime"
           output=$(docker run --rm \
-            --volume "$PWD/dist:/dist:ro" \
+            --volume "$RUNNER_TEMP/chime-cli-runtime:/dist:ro" \
             --env EXPECTED_VERSION="$VERSION" \
             docker.io/library/debian:12.15-slim \
             sh -ec 'apt-get update >/dev/null && apt-get install --no-install-recommends -y ca-certificates libgcc-s1 libssl3 libzstd1 zlib1g >/dev/null && test "$(/dist/chime --version)" = "chime $EXPECTED_VERSION"')
@@ -352,7 +354,8 @@ jobs:
             --bundle-from-oci; then
             {
               echo "### Recovery required"
-              echo "GHCR already contains `$IMAGE_REF` at `$IMAGE_DIGEST`, but its expected release provenance did not verify. The workflow stopped without overwriting it. Review and recover this image outside the automated path."
+              printf 'GHCR already contains `%s` at `%s`, but its expected release provenance did not verify. The workflow stopped without overwriting it. Review and recover this image outside the automated path.\n' \
+                "$IMAGE_REF" "$IMAGE_DIGEST"
             } >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
@@ -419,7 +422,9 @@ jobs:
             --read-only \
             --tmpfs /tmp:rw,noexec,nosuid,size=16m \
             --volume "$state_dir:/var/lib/chime:rw" \
-            "$image_by_digest" >/dev/null
+            "$image_by_digest" \
+            --origin https://chime.example-tailnet.ts.net \
+            --data-dir /var/lib/chime >/dev/null
           served=false
           for attempt in $(seq 1 30); do
             if curl --fail --silent http://127.0.0.1:8080/ --output "$RUNNER_TEMP/chime-index.html" 2>/dev/null; then
@@ -544,14 +549,14 @@ jobs:
               exit 1
             }
           {
-            echo "## Published Chime release $TAG"
-            echo
-            echo "- Source: `$SOURCE_SHA`"
-            echo "- Image: `$IMAGE_REF`"
-            echo "- OCI digest: `$IMAGE_DIGEST`"
-            echo "- CLI: `$CLI_ARCHIVE`"
-            echo "- CLI SHA-256: `$(cat "$RUNNER_TEMP/cli-sha256.txt")`"
-            echo "- The GHCR image was pulled without registry credentials and its server UI responded in the Linux AMD64 runner."
+            printf '## Published Chime release %s\n\n' "$TAG"
+            printf -- '- Source: `%s`\n' "$SOURCE_SHA"
+            printf -- '- Image: `%s`\n' "$IMAGE_REF"
+            printf -- '- OCI digest: `%s`\n' "$IMAGE_DIGEST"
+            printf -- '- CLI: `%s`\n' "$CLI_ARCHIVE"
+            cli_sha=$(<"$RUNNER_TEMP/cli-sha256.txt")
+            printf -- '- CLI SHA-256: `%s`\n' "$cli_sha"
+            printf '%s\n' '- The GHCR image was pulled without registry credentials and its server UI responded in the Linux AMD64 runner.'
           } >> "$GITHUB_STEP_SUMMARY"
           gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
             --field draft=false >/dev/null
