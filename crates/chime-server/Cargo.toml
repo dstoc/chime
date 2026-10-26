@@ -3,3 +3,21 @@ name = "chime-server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+base64.workspace = true
+clap.workspace = true
+include_dir.workspace = true
+mime_guess.workspace = true
+p256.workspace = true
+rusqlite.workspace = true
+tokio.workspace = true
+url.workspace = true
+web-push.workspace = true
+webauthn-rs.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tower.workspace = true
