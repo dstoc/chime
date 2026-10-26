@@ -514,8 +514,7 @@ jobs:
             count=$(jq 'length' <<< "$matches")
             if [[ "$count" -eq 0 ]]; then
               assert_draft
-              # gh api --hostname uploads.github.com incorrectly targets
-              # api.uploads.github.com. Release assets use a distinct host.
+              # Release assets use a separate upload host from the REST API.
               encoded_name=$(jq -nr --arg name "$name" '$name | @uri')
               upload_response=$(curl --fail-with-body --silent --show-error \
                 --request POST \
