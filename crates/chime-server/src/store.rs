@@ -12,7 +12,6 @@ const DATABASE_CONCURRENCY: usize = 4;
 const SCHEMA_VERSION: i64 = 1;
 
 pub struct Store {
-    _lock: data_dir::DataDirLock,
     database: Database,
     vapid: VapidIdentity,
 }
@@ -37,9 +36,9 @@ impl Store {
         drop(connection);
 
         Ok(Self {
-            _lock: lock,
             database: Database {
                 path: database_path,
+                lock: Arc::new(lock),
                 slots: Arc::new(Semaphore::new(DATABASE_CONCURRENCY)),
             },
             vapid,
@@ -58,6 +57,7 @@ impl Store {
 #[derive(Clone)]
 pub struct Database {
     path: PathBuf,
+    lock: Arc<data_dir::DataDirLock>,
     slots: Arc<Semaphore>,
 }
 
@@ -72,24 +72,32 @@ impl Database {
             .await
             .context("SQLite operation queue is closed")?;
         let path = self.path.clone();
+        let lock = Arc::clone(&self.lock);
 
-        tokio::task::spawn_blocking(move || run_blocking(&path, permit, operation))
+        tokio::task::spawn_blocking(move || run_blocking(&path, permit, lock, operation))
             .await
             .context("SQLite blocking worker failed")?
     }
 }
 
-fn run_blocking<T, F>(path: &Path, _permit: OwnedSemaphorePermit, operation: F) -> Result<T>
+fn run_blocking<T, F>(
+    path: &Path,
+    _permit: OwnedSemaphorePermit,
+    _lock: Arc<data_dir::DataDirLock>,
+    operation: F,
+) -> Result<T>
 where
     F: FnOnce(&mut Connection) -> rusqlite::Result<T>,
 {
-    let mut connection = Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_FULL_MUTEX,
-    )
-    .with_context(|| format!("open SQLite connection {}", path.display()))?;
-    configure_connection(&connection)?;
-    operation(&mut connection).context("run SQLite operation")
+    (|| {
+        let mut connection = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_FULL_MUTEX,
+        )
+        .with_context(|| format!("open SQLite connection {}", path.display()))?;
+        configure_connection(&connection)?;
+        operation(&mut connection).context("run SQLite operation")
+    })()
 }
 
 fn configure_connection(connection: &Connection) -> Result<()> {
@@ -188,16 +196,45 @@ fn read_vapid_identity(connection: &Connection) -> Result<VapidIdentity> {
 mod tests {
     use super::{Database, Store, apply_migration_one_with_keys, configure_connection};
     use crate::vapid::VapidIdentity;
-    use anyhow::Result;
+    use anyhow::{Context, Result};
     use rusqlite::{Connection, TransactionBehavior};
     use std::{
+        path::Path,
         sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
+            mpsc,
         },
         thread,
         time::Duration,
     };
+
+    fn assert_directory_locked(path: &Path) {
+        let error = match Store::open(path) {
+            Ok(_) => panic!("another Store acquired a directory that is still in use"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("already in use"),
+            "expected the directory lock to reject another Store, got: {error:#}"
+        );
+    }
+
+    async fn wait_until_directory_opens(path: &Path) -> Result<Store> {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match Store::open(path) {
+                    Ok(store) => return Ok(store),
+                    Err(error) if error.to_string().contains("already in use") => {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        })
+        .await
+        .context("directory lock was not released after the blocking worker finished")?
+    }
 
     #[test]
     fn migrations_are_atomic() -> Result<()> {
@@ -257,6 +294,71 @@ mod tests {
             })
             .await?;
         assert_eq!(version, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cloned_database_keeps_directory_locked_until_dropped() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let path = root.path().join("state");
+        let first = Store::open(&path)?;
+        let database = first.database().clone();
+        drop(first);
+
+        assert_directory_locked(&path);
+        drop(database);
+
+        let _second = Store::open(&path)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelled_caller_keeps_directory_locked_until_worker_finishes() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let path = root.path().join("state");
+        let first = Store::open(&path)?;
+        let database = first.database().clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+
+        let task = tokio::spawn(async move {
+            database
+                .run(move |connection| {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    let result = connection
+                        .execute_batch("CREATE TABLE cancelled_owner_writes (id INTEGER)");
+                    finished_tx.send(()).unwrap();
+                    result
+                })
+                .await
+        });
+        started_rx.await?;
+        task.abort();
+        assert!(
+            task.await
+                .expect_err("aborted task should not finish normally")
+                .is_cancelled()
+        );
+        drop(first);
+
+        assert_directory_locked(&path);
+        release_tx.send(()).unwrap();
+        finished_rx.await?;
+
+        let second = wait_until_directory_opens(&path).await?;
+        let table_count = second
+            .database()
+            .run(|connection| {
+                connection.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'cancelled_owner_writes'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+            })
+            .await?;
+        assert_eq!(table_count, 1);
         Ok(())
     }
 
