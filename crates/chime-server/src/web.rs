@@ -2,6 +2,7 @@ use crate::admin::{
     AddFinishRequest, AdminError, AdminFinishRequest, AdminRequest, AdminResponse, AdminState,
     SetupFinishRequest, SetupStartRequest,
 };
+use crate::notify::NotifyState;
 use axum::{
     Router,
     body::Body,
@@ -11,6 +12,7 @@ use axum::{
     response::Response,
     routing::{get, post},
 };
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use include_dir::{Dir, include_dir};
 use serde::Serialize;
 
@@ -19,10 +21,18 @@ static WEB_ASSETS: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../../web");
 const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; base-uri 'none'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; img-src 'self'; script-src 'self'; style-src 'self'";
 const MAX_JSON_BODY_BYTES: usize = 16 * 1024;
 
-pub fn router(state: AdminState) -> Router {
+#[derive(Clone)]
+struct AppState {
+    admin: AdminState,
+    notify: NotifyState,
+}
+
+pub fn router(admin: AdminState, notifications: NotifyState) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/api/setup/status", get(setup_status))
+        .route("/api/push-key", get(push_key))
+        .route("/api/notify", post(notify))
         .route("/api/setup/start", post(setup_start))
         .route("/api/setup/finish", post(setup_finish))
         .route("/api/admin/challenge", post(admin_challenge))
@@ -30,7 +40,10 @@ pub fn router(state: AdminState) -> Router {
         .route("/api/admin/add/finish", post(add_finish))
         .route("/{*path}", get(asset))
         .fallback(not_found)
-        .with_state(state)
+        .with_state(AppState {
+            admin,
+            notify: notifications,
+        })
         .layer(DefaultBodyLimit::max(MAX_JSON_BODY_BYTES))
         .layer(middleware::from_fn(security_headers))
 }
@@ -51,8 +64,8 @@ async fn not_found(uri: Uri) -> Response {
     error_response(StatusCode::NOT_FOUND, "Not found.")
 }
 
-async fn setup_status(State(state): State<AdminState>) -> Response {
-    match state.setup_status().await {
+async fn setup_status(State(state): State<AppState>) -> Response {
+    match state.admin.setup_status().await {
         Ok(status) => api_json(StatusCode::OK, status),
         Err(_) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -61,74 +74,110 @@ async fn setup_status(State(state): State<AdminState>) -> Response {
     }
 }
 
-async fn setup_start(State(state): State<AdminState>, request: Request<Body>) -> Response {
-    if !origin_matches(&request, &state) {
+async fn push_key(State(state): State<AppState>) -> Response {
+    api_json(
+        StatusCode::OK,
+        serde_json::json!({ "public_key": state.admin.push_public_key() }),
+    )
+}
+
+async fn notify(State(state): State<AppState>, request: Request<Body>) -> Response {
+    let Some(secret) = bearer_secret(&request) else {
+        return error_response(
+            StatusCode::UNAUTHORIZED,
+            "A valid Chime send key is required.",
+        );
+    };
+    let body = match parse_json::<chime_protocol::NotificationRequest>(request).await {
+        Ok(body) => body,
+        Err(status) => return error_response(status, "The request body is invalid."),
+    };
+    match state.notify.send(secret, body).await {
+        Ok(summary) => api_json(StatusCode::OK, summary),
+        Err(error) => error_response(error.status, error.message),
+    }
+}
+
+async fn setup_start(State(state): State<AppState>, request: Request<Body>) -> Response {
+    if !origin_matches(&request, &state.admin) {
         return origin_error();
     }
     let body = match parse_json::<SetupStartRequest>(request).await {
         Ok(body) => body,
         Err(status) => return error_response(status, "The request body is invalid."),
     };
-    match state.start_setup(body).await {
+    match state.admin.start_setup(body).await {
         Ok(challenge) => api_json(StatusCode::OK, challenge),
         Err(error) => admin_error(error),
     }
 }
 
-async fn setup_finish(State(state): State<AdminState>, request: Request<Body>) -> Response {
-    if !origin_matches(&request, &state) {
+async fn setup_finish(State(state): State<AppState>, request: Request<Body>) -> Response {
+    if !origin_matches(&request, &state.admin) {
         return origin_error();
     }
     let body = match parse_json::<SetupFinishRequest>(request).await {
         Ok(body) => body,
         Err(status) => return error_response(status, "The request body is invalid."),
     };
-    match state.finish_setup(body).await {
+    match state.admin.finish_setup(body).await {
         Ok(()) => api_json(StatusCode::OK, serde_json::json!({ "ok": true })),
         Err(error) => admin_error(error),
     }
 }
 
-async fn admin_challenge(State(state): State<AdminState>, request: Request<Body>) -> Response {
-    if !origin_matches(&request, &state) {
+async fn admin_challenge(State(state): State<AppState>, request: Request<Body>) -> Response {
+    if !origin_matches(&request, &state.admin) {
         return origin_error();
     }
     let body = match parse_json::<AdminRequest>(request).await {
         Ok(body) => body,
         Err(status) => return error_response(status, "The request body is invalid."),
     };
-    match state.start_admin_operation(body).await {
+    match state.admin.start_admin_operation(body).await {
         Ok(challenge) => api_json(StatusCode::OK, challenge),
         Err(error) => admin_error(error),
     }
 }
 
-async fn admin_finish(State(state): State<AdminState>, request: Request<Body>) -> Response {
-    if !origin_matches(&request, &state) {
+async fn admin_finish(State(state): State<AppState>, request: Request<Body>) -> Response {
+    if !origin_matches(&request, &state.admin) {
         return origin_error();
     }
     let body = match parse_json::<AdminFinishRequest>(request).await {
         Ok(body) => body,
         Err(status) => return error_response(status, "The request body is invalid."),
     };
-    match state.finish_admin_operation(body).await {
+    match state.admin.finish_admin_operation(body).await {
         Ok(response) => api_json(StatusCode::OK, response),
         Err(error) => admin_error(error),
     }
 }
 
-async fn add_finish(State(state): State<AdminState>, request: Request<Body>) -> Response {
-    if !origin_matches(&request, &state) {
+async fn add_finish(State(state): State<AppState>, request: Request<Body>) -> Response {
+    if !origin_matches(&request, &state.admin) {
         return origin_error();
     }
     let body = match parse_json::<AddFinishRequest>(request).await {
         Ok(body) => body,
         Err(status) => return error_response(status, "The request body is invalid."),
     };
-    match state.finish_add_passkey(body).await {
+    match state.admin.finish_add_passkey(body).await {
         Ok(passkeys) => api_json(StatusCode::OK, AdminResponse::Passkeys { passkeys }),
         Err(error) => admin_error(error),
     }
+}
+
+fn bearer_secret(request: &Request<Body>) -> Option<String> {
+    let value = request
+        .headers()
+        .get(header::AUTHORIZATION)?
+        .to_str()
+        .ok()?;
+    let token = value.strip_prefix("Bearer ")?;
+    let encoded = token.strip_prefix("chime_sk_")?;
+    let decoded = URL_SAFE_NO_PAD.decode(encoded).ok()?;
+    (decoded.len() == 32 && URL_SAFE_NO_PAD.encode(&decoded) == encoded).then(|| token.to_owned())
 }
 
 async fn parse_json<T>(request: Request<Body>) -> Result<T, StatusCode>
@@ -244,9 +293,12 @@ fn secure_response(mut response: Response) -> Response {
 #[cfg(test)]
 mod tests {
     use super::{AdminState, CONTENT_SECURITY_POLICY, MAX_JSON_BODY_BYTES, StatusCode, router};
+    use crate::notify::NotifyState;
+    use crate::push::WebPushTransport;
     use crate::{config::Origin, store::Store};
     use axum::{body::Body, http::Request};
     use std::str::FromStr;
+    use std::sync::Arc;
     use tower::ServiceExt;
 
     async fn app() -> (axum::Router, tempfile::TempDir, String) {
@@ -255,7 +307,10 @@ mod tests {
         let code = store.initialize_setup_code().await.unwrap().unwrap();
         let origin = Origin::from_str("https://chime.example-tailnet.ts.net").unwrap();
         (
-            router(AdminState::new(store, &origin).unwrap()),
+            router(
+                AdminState::new(store.clone(), &origin).unwrap(),
+                NotifyState::new(store, Arc::new(WebPushTransport::new().unwrap())),
+            ),
             directory,
             code,
         )

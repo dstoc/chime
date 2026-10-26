@@ -4,13 +4,17 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Chime</title>
+    <meta name="theme-color" content="#176a63">
+    <link rel="manifest" href="/manifest.webmanifest">
+    <link rel="icon" type="image/svg+xml" href="/icons/chime.svg">
+    <link rel="apple-touch-icon" sizes="180x180" href="/icons/chime-180.png">
     <link rel="stylesheet" href="/styles.css">
   </head>
   <body>
     <main class="page">
       <p class="eyebrow">Private notifications</p>
       <h1>Chime</h1>
-      <p class="description">Set up and manage administrator passkeys for this Chime server.</p>
+      <p class="description">Send short notifications to your enrolled browsers.</p>
       <p class="status"><span class="status-dot" aria-hidden="true"></span><span id="server-status">Connecting to Chime…</span></p>
 
       <section id="setup" class="panel" hidden>
@@ -40,6 +44,47 @@
             <button type="submit">Add</button>
           </div>
         </form>
+      </section>
+
+      <section id="device-setup" class="panel" hidden>
+        <h2>This browser</h2>
+        <p id="notification-help" class="hint">Choose Enable notifications to ask for permission and enroll this browser with a passkey.</p>
+        <form id="device-form">
+          <label for="device-name">Device name</label>
+          <input id="device-name" name="name" type="text" maxlength="100" autocomplete="off" value="Browser">
+          <button id="enable-notifications" type="submit">Enable notifications</button>
+        </form>
+        <p id="device-status" class="hint" role="status" aria-live="polite"></p>
+      </section>
+
+      <section id="keys" class="panel" hidden>
+        <h2>Send keys</h2>
+        <p>Each key can send notifications only. Copy a new key now; Chime cannot show it again.</p>
+        <form id="create-key-form">
+          <label for="key-name">Create a send key</label>
+          <div class="inline-form">
+            <input id="key-name" name="name" type="text" maxlength="100" autocomplete="off" placeholder="Application name" required>
+            <button type="submit">Create key</button>
+          </div>
+        </form>
+        <div id="new-key" class="secret-panel" hidden>
+          <label for="new-key-value">New key (shown once)</label>
+          <div class="inline-form">
+            <input id="new-key-value" type="password" readonly>
+            <button id="copy-key" type="button">Copy</button>
+            <button id="show-key" type="button">Show</button>
+          </div>
+          <p class="hint">Store it in a protected config file or environment variable. Do not share it with untrusted applications.</p>
+        </div>
+        <div class="actions"><button id="list-keys" type="button">View send keys</button></div>
+        <ul id="send-key-list" class="record-list" aria-label="Send keys"></ul>
+      </section>
+
+      <section id="devices" class="panel" hidden>
+        <h2>Receiving devices</h2>
+        <p>Enrolled browsers receive each text notification. Remove devices that should stop receiving messages.</p>
+        <div class="actions"><button id="list-devices" type="button">View devices</button></div>
+        <ul id="device-list" class="record-list" aria-label="Receiving devices"></ul>
       </section>
 
       <p id="message" class="message" role="status" aria-live="polite"></p>

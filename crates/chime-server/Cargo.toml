@@ -6,11 +6,15 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+async-trait.workspace = true
 axum.workspace = true
 base64.workspace = true
+chime-protocol = { path = "../chime-protocol" }
 clap.workspace = true
 getrandom.workspace = true
 include_dir.workspace = true
+futures-lite.workspace = true
+isahc.workspace = true
 mime_guess.workspace = true
 p256.workspace = true
 rusqlite.workspace = true

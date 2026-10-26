@@ -1,6 +1,9 @@
 mod admin;
 mod config;
 mod data_dir;
+mod devices;
+mod notify;
+mod push;
 mod store;
 mod vapid;
 mod web;
@@ -9,6 +12,9 @@ use anyhow::{Context, Result};
 use axum::serve;
 use clap::Parser;
 use config::{Args, Config};
+use notify::NotifyState;
+use push::WebPushTransport;
+use std::sync::Arc;
 use std::{ffi::OsStr, net::SocketAddr, path::PathBuf};
 use store::Store;
 use tokio::net::TcpListener;
@@ -44,8 +50,12 @@ async fn main() -> Result<()> {
     if let Some(code) = store.initialize_setup_code().await? {
         eprintln!("First-use setup code (sensitive; save it now): {code}");
     }
-    let admin_state = admin::AdminState::new(store, &config.origin)
+    let admin_state = admin::AdminState::new(store.clone(), &config.origin)
         .context("initialize passkey administration")?;
+    let notify_state = NotifyState::new(
+        store,
+        Arc::new(WebPushTransport::new().context("initialize Web Push client")?),
+    );
 
     let listen_address = SocketAddr::from(([127, 0, 0, 1], 8080));
     let listener = TcpListener::bind(listen_address)
@@ -56,7 +66,7 @@ async fn main() -> Result<()> {
         config.origin.as_str()
     );
 
-    serve(listener, web::router(admin_state))
+    serve(listener, web::router(admin_state, notify_state))
         .with_graceful_shutdown(shutdown_signal())
         .await
         .context("serve HTTP requests")

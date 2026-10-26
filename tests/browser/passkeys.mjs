@@ -1,4 +1,4 @@
-import { createHash, createPrivateKey, sign } from 'node:crypto';
+import { createHash, createPrivateKey, generateKeyPairSync, sign } from 'node:crypto';
 import { spawn, execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import http from 'node:http';
@@ -15,11 +15,13 @@ if (!fs.existsSync(serverBinary)) throw new Error(`server binary not found: ${se
 if (!fs.existsSync(chromiumPath)) throw new Error(`Chromium not found: ${chromiumPath}; set CHROMIUM_PATH if needed`);
 
 const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'chime-passkeys-'));
+const databasePath = path.join(workspace, 'data', 'chime.sqlite3');
 let service;
 let browser;
 let proxy;
 let socket;
 let authenticatorId;
+const serviceOutput = [];
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function freePort() {
@@ -117,6 +119,8 @@ service = spawn(serverBinary, [
 ], { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
 service.stdout.setEncoding('utf8');
 service.stderr.setEncoding('utf8');
+service.stdout.on('data', (text) => serviceOutput.push(text));
+service.stderr.on('data', (text) => serviceOutput.push(text));
 const code = await waitForSetupCode();
 
 const browserProfile = path.join(workspace, 'browser');
@@ -137,8 +141,13 @@ await new Promise((resolve, reject) => {
 });
 let nextId = 0;
 const pending = new Map();
+let serviceWorkerRegistrationId = null;
 socket.addEventListener('message', (event) => {
   const message = JSON.parse(event.data);
+  if (message.method === 'ServiceWorker.workerRegistrationUpdated') {
+    const registration = message.params.registrations.find((entry) => entry.scopeURL === `${origin}/` && !entry.isDeleted);
+    if (registration) serviceWorkerRegistrationId = registration.registrationId;
+  }
   if (message.id && pending.has(message.id)) {
     const { resolve, reject } = pending.get(message.id);
     pending.delete(message.id);
@@ -171,6 +180,20 @@ async function waitFor(predicate, timeoutMs = 10000) {
     await sleep(150);
   }
   throw new Error('timed out waiting for page state');
+}
+function sqliteQuery(statement, params = []) {
+  const script = 'import json, sqlite3, sys; request=json.loads(sys.stdin.read()); db=sqlite3.connect(sys.argv[1]); rows=db.execute(request["statement"], request["params"]).fetchall(); print(json.dumps(rows)); db.close()';
+  const output = execFileSync('python3', ['-c', script, databasePath], {
+    input: JSON.stringify({ statement, params }),
+    encoding: 'utf8',
+  });
+  return JSON.parse(output);
+}
+function persistentFilesContain(value) {
+  return ['chime.sqlite3', 'chime.sqlite3-wal', 'chime.sqlite3-shm']
+    .map((name) => path.join(workspace, 'data', name))
+    .filter((file) => fs.existsSync(file))
+    .some((file) => fs.readFileSync(file).includes(Buffer.from(value)));
 }
 await cdp('Page.enable');
 await cdp('Runtime.enable');
@@ -214,6 +237,200 @@ const firstList = await evaluate(`(async () => {
   return { message: document.querySelector('#message').textContent, count: document.querySelectorAll('#passkey-list li button').length };
 })()`);
 if (firstList.count !== 1 || firstList.message !== 'Passkey list updated.') throw new Error(`list failed: ${JSON.stringify(firstList)}`);
+
+async function createSendKeyInUi(name) {
+  await evaluate(`(() => {
+    document.querySelector('#key-name').value = ${JSON.stringify(name)};
+    document.querySelector('#create-key-form').requestSubmit();
+  })()`);
+  await waitFor((state) => state.message.startsWith('Send key created.'));
+  return evaluate(`(() => ({
+    secret: document.querySelector('#new-key-value').value,
+    keyPanelHidden: document.querySelector('#new-key').hidden,
+    keyList: document.querySelector('#send-key-list').textContent,
+  }))()`);
+}
+
+async function sendWithKey(key) {
+  const authorization = JSON.stringify(`Bearer ${key}`);
+  return evaluate(`(async () => {
+    const response = await fetch('/api/notify', {
+      method: 'POST',
+      headers: { 'Authorization': ${authorization}, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: 'Local acceptance check' }),
+    });
+    let body = null;
+    try { body = await response.json(); } catch {}
+    return { status: response.status, body };
+  })()`);
+}
+
+const firstSendKey = await createSendKeyInUi('QA sender one');
+if (!firstSendKey.secret.startsWith('chime_sk_') || firstSendKey.keyPanelHidden) {
+  throw new Error('the send-key UI did not show a new key once');
+}
+const storedSendKeyDigest = sqliteQuery('SELECT hex(secret_digest) FROM send_keys WHERE name = ?', ['QA sender one']);
+const expectedSendKeyDigest = createHash('sha256').update(firstSendKey.secret).digest('hex').toUpperCase();
+if (storedSendKeyDigest.length !== 1 || storedSendKeyDigest[0][0] !== expectedSendKeyDigest
+  || persistentFilesContain(firstSendKey.secret) || serviceOutput.join('').includes(firstSendKey.secret)) {
+  throw new Error('send-key plaintext was stored or logged instead of storing only its digest');
+}
+const firstSendKeyListed = await evaluate(`(async () => {
+  document.querySelector('#list-keys').click();
+  await new Promise(resolve => setTimeout(resolve, 900));
+  const text = document.querySelector('#send-key-list').textContent;
+  return { message: document.querySelector('#message').textContent, text };
+})()`);
+if (firstSendKeyListed.message !== 'Send key list updated.' || firstSendKeyListed.text.includes(firstSendKey.secret)) {
+  throw new Error('send-key list did not return metadata only');
+}
+const noDevices = await sendWithKey(firstSendKey.secret);
+if (noDevices.status !== 200 || noDevices.body.outcome !== 'no_devices') {
+  throw new Error(`send without enrolled devices returned ${JSON.stringify(noDevices)}`);
+}
+await evaluate(`(() => document.querySelector('#send-key-list .revoke-button').click())()`);
+const revokedKeyUi = await waitFor((state) => state.message === 'Send key revoked.');
+const revokedKeySend = await sendWithKey(firstSendKey.secret);
+if (revokedKeySend.status !== 401 || !revokedKeyUi.message.includes('revoked')) {
+  throw new Error('revoked send key remained valid');
+}
+const secondSendKey = await createSendKeyInUi('QA sender two');
+const secondKeyNoDevices = await sendWithKey(secondSendKey.secret);
+if (!secondSendKey.secret.startsWith('chime_sk_') || secondKeyNoDevices.status !== 200 || secondKeyNoDevices.body.outcome !== 'no_devices') {
+  throw new Error('revoking one send key affected an independent key');
+}
+
+const generatedSubscriptionKeys = generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
+const subscriptionPublicDer = generatedSubscriptionKeys.publicKey.export({ format: 'der', type: 'spki' });
+const testSubscription = {
+  endpoint: 'https://fcm.googleapis.com/fcm/send/local-test-token',
+  expirationTime: null,
+  keys: {
+    p256dh: subscriptionPublicDer.subarray(-65).toString('base64url'),
+    auth: Buffer.from('0123456789abcdef').toString('base64url'),
+  },
+};
+const invalidSubscription = await evaluate(`(async () => {
+  const response = await fetch('/api/admin/challenge', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({kind:'enroll_device', name:'Bad device', subscription:{...${JSON.stringify(testSubscription)}, endpoint:'https://127.0.0.1/private'}}),
+  });
+  return response.status;
+})()`);
+if (invalidSubscription !== 400) throw new Error(`unsupported provider endpoint returned ${invalidSubscription}`);
+
+async function completeAdminOperation(operation) {
+  const assertion = await browserAssertion(operation);
+  return finishAt('/api/admin/finish', {
+    request_id: assertion.requestId,
+    credential: assertion.credential,
+  });
+}
+const firstEnrollment = await completeAdminOperation({ kind: 'enroll_device', name: 'QA browser', subscription: testSubscription });
+if (firstEnrollment.status !== 200 || firstEnrollment.body.kind !== 'device_enrolled') {
+  throw new Error(`device enrollment failed: ${JSON.stringify(firstEnrollment)}`);
+}
+const secondEnrollment = await completeAdminOperation({ kind: 'enroll_device', name: 'QA browser renamed', subscription: testSubscription });
+if (secondEnrollment.status !== 200
+  || secondEnrollment.body.device.id !== firstEnrollment.body.device.id
+  || secondEnrollment.body.token === firstEnrollment.body.token
+  || secondEnrollment.body.devices.length !== 1) {
+  throw new Error('duplicate endpoint enrollment did not upsert and rotate the token');
+}
+const tokenStorage = await evaluate(`(async () => {
+  const tokens = await import('/device-token.js');
+  await tokens.saveDeviceCredentials(${JSON.stringify(secondEnrollment.body.device.id)}, ${JSON.stringify(secondEnrollment.body.token)});
+  return tokens.getDeviceCredentials();
+})()`);
+if (tokenStorage.device_id !== secondEnrollment.body.device.id || tokenStorage.token !== secondEnrollment.body.token) {
+  throw new Error('device token was not stored in IndexedDB');
+}
+const storedDeviceTokenDigest = sqliteQuery('SELECT hex(token_digest) FROM receiving_devices WHERE id = ?', [secondEnrollment.body.device.id]);
+const expectedDeviceTokenDigest = createHash('sha256').update(secondEnrollment.body.token).digest('hex').toUpperCase();
+if (storedDeviceTokenDigest.length !== 1 || storedDeviceTokenDigest[0][0] !== expectedDeviceTokenDigest
+  || persistentFilesContain(secondEnrollment.body.token) || serviceOutput.join('').includes(secondEnrollment.body.token)) {
+  throw new Error('device token plaintext was stored or logged instead of storing only its digest');
+}
+const listedDevices = await completeAdminOperation({ kind: 'list_devices' });
+if (listedDevices.status !== 200 || listedDevices.body.devices.length !== 1) {
+  throw new Error('device list did not contain one upserted endpoint');
+}
+const removedDevice = await completeAdminOperation({ kind: 'remove_device', id: secondEnrollment.body.device.id });
+if (removedDevice.status !== 200 || removedDevice.body.devices.length !== 0) {
+  throw new Error('device removal did not invalidate its record');
+}
+const clearedToken = await evaluate(`(async () => {
+  const tokens = await import('/device-token.js');
+  await tokens.clearDeviceCredentials();
+  return tokens.getDeviceCredentials();
+})()`);
+if (clearedToken !== null) throw new Error('removed device token remained in IndexedDB');
+
+const payloadValidation = await evaluate(`(async () => {
+  const { validatePayload } = await import('/sw.js');
+  const valid = {
+    version: 1, id: 'AAAAAAAAAAAAAAAAAAAAAA', title: 'Build complete', body: 'All checks passed',
+    expires_at: Math.floor(Date.now() / 1000) + 3600, ack_capability: 'A'.repeat(43),
+  };
+  return {
+    valid: validatePayload(valid),
+    oldVersion: validatePayload({ ...valid, version: 2 }),
+    expired: validatePayload({ ...valid, expires_at: 1 }),
+    unsafeExtra: validatePayload({ ...valid, html: '<script>' }),
+  };
+})()`);
+if (!payloadValidation.valid || payloadValidation.oldVersion || payloadValidation.expired || payloadValidation.unsafeExtra) {
+  throw new Error(`service-worker payload validation failed: ${JSON.stringify(payloadValidation)}`);
+}
+await cdp('Browser.grantPermissions', { origin, permissions: ['notifications'] });
+await cdp('ServiceWorker.enable');
+await evaluate(`navigator.serviceWorker.register('/sw.js', { type: 'module' }).then(() => navigator.serviceWorker.ready)`);
+for (let attempt = 0; attempt < 100 && !serviceWorkerRegistrationId; attempt += 1) await sleep(50);
+if (!serviceWorkerRegistrationId) throw new Error('service worker did not register with Chromium');
+const validPushPayload = {
+  version: 1,
+  id: 'AAAAAAAAAAAAAAAAAAAAAA',
+  title: 'Build complete',
+  body: 'All checks passed',
+  expires_at: Math.floor(Date.now() / 1000) + 3600,
+  ack_capability: 'A'.repeat(43),
+};
+await cdp('ServiceWorker.deliverPushMessage', {
+  origin,
+  registrationId: serviceWorkerRegistrationId,
+  data: JSON.stringify(validPushPayload),
+});
+const displayedPush = await evaluate(`(async () => {
+  const registration = await navigator.serviceWorker.ready;
+  for (let attempt = 0; attempt < 60; attempt += 1) {
+    const notifications = await registration.getNotifications({ tag: 'chime-AAAAAAAAAAAAAAAAAAAAAA' });
+    if (notifications.length) return notifications.map((item) => ({ title: item.title, body: item.body, data: item.data }));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  return [];
+})()`);
+if (displayedPush.length !== 1 || displayedPush[0].title !== 'Build complete' || displayedPush[0].body !== 'All checks passed') {
+  throw new Error(`valid push was not displayed as text: ${JSON.stringify(displayedPush)}`);
+}
+const invalidPushPayload = { ...validPushPayload, id: 'BBBBBBBBBBBBBBBBBBBBBB', version: 2 };
+await cdp('ServiceWorker.deliverPushMessage', {
+  origin,
+  registrationId: serviceWorkerRegistrationId,
+  data: JSON.stringify(invalidPushPayload),
+});
+const fallbackPush = await evaluate(`(async () => {
+  const registration = await navigator.serviceWorker.ready;
+  for (let attempt = 0; attempt < 60; attempt += 1) {
+    const notifications = await registration.getNotifications();
+    const fallback = notifications.find((item) => item.title === 'Chime');
+    if (fallback) return { title: fallback.title, body: fallback.body };
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  return null;
+})()`);
+if (!fallbackPush || fallbackPush.body !== 'A notification could not be displayed.') {
+  throw new Error(`malformed push fallback was not displayed: ${JSON.stringify(fallbackPush)}`);
+}
 await evaluate(`(() => {
   window.qaOriginalCreate = navigator.credentials.create.bind(navigator.credentials);
   navigator.credentials.create = (options) => new Promise((resolve, reject) => {
@@ -645,6 +862,18 @@ console.log(JSON.stringify({
   adminUserVerification: wrongChallengeAssertion.uv,
   setup: 'passed',
   listPasskeys: firstList.count,
+  sendKeyCreatedOnce: firstSendKey.secret.startsWith('chime_sk_'),
+  sendKeyDigestStored: storedSendKeyDigest.length === 1 && storedSendKeyDigest[0][0] === expectedSendKeyDigest,
+  sendKeyListMetadataOnly: !firstSendKeyListed.text.includes(firstSendKey.secret),
+  revokedSendKey: revokedKeySend.status,
+  independentSendKey: secondKeyNoDevices.body.outcome,
+  deviceEnrollmentUpsert: firstEnrollment.body.device.id === secondEnrollment.body.device.id,
+  deviceTokenRotated: firstEnrollment.body.token !== secondEnrollment.body.token,
+  deviceTokenDigestStored: storedDeviceTokenDigest.length === 1 && storedDeviceTokenDigest[0][0] === expectedDeviceTokenDigest,
+  deviceRemoval: removedDevice.body.devices.length,
+  serviceWorkerPayloadValidation: payloadValidation,
+  notificationDisplay: displayedPush,
+  malformedPushFallback: fallbackPush,
   addPasskey: addSecondResult.count,
   addCancellation: 'passed with input preserved',
   removal: 'passed',

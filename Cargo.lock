@@ -392,6 +392,16 @@ checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 [[package]]
 name = "chime-cli"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.23.1",
+ "chime-protocol",
+ "clap",
+ "isahc",
+ "serde",
+ "serde_json",
+ "url",
+]
 
 [[package]]
 name = "chime-protocol"
@@ -406,11 +416,15 @@ name = "chime-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "base64 0.23.1",
+ "chime-protocol",
  "clap",
+ "futures-lite",
  "getrandom 0.4.3",
  "include_dir",
+ "isahc",
  "mime_guess",
  "p256 0.14.0",
  "rusqlite",

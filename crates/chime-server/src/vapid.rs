@@ -3,6 +3,7 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use p256::{SecretKey, elliptic_curve::Generate};
 use web_push::VapidSignatureBuilder;
 
+#[derive(Clone)]
 pub struct VapidIdentity {
     private_key: Vec<u8>,
     public_key: Vec<u8>,
