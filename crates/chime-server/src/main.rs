@@ -1,7 +1,6 @@
+mod admin;
 mod config;
 mod data_dir;
-// The storage operations are established in this milestone and consumed by later server routes.
-#[allow(dead_code)]
 mod store;
 mod vapid;
 mod web;
@@ -10,14 +9,43 @@ use anyhow::{Context, Result};
 use axum::serve;
 use clap::Parser;
 use config::{Args, Config};
-use std::net::SocketAddr;
+use std::{ffi::OsStr, net::SocketAddr, path::PathBuf};
 use store::Store;
 use tokio::net::TcpListener;
 
+#[derive(Debug, Parser)]
+#[command(
+    name = "reset-admin",
+    bin_name = "chime-server reset-admin",
+    about = "Replace administrator passkeys while Chime is stopped"
+)]
+struct ResetAdminArgs {
+    /// Private Chime data directory
+    #[arg(long, value_name = "PATH")]
+    data_dir: PathBuf,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    let mut raw_args = std::env::args_os();
+    let program = raw_args.next().unwrap_or_else(|| "chime-server".into());
+    if raw_args.next().as_deref() == Some(OsStr::new("reset-admin")) {
+        let args = ResetAdminArgs::parse_from(std::iter::once(program).chain(raw_args));
+        let code = Store::reset_admin(&args.data_dir)?;
+        println!(
+            "Administrator passkeys were cleared. Send keys, device subscriptions, and the VAPID identity were preserved; revoke them separately if compromise is suspected."
+        );
+        println!("New single-use setup code (expires in 15 minutes): {code}");
+        return Ok(());
+    }
+
     let config = Config::checked(Args::parse())?;
-    let _store = Store::open(&config.data_dir).context("initialize Chime state")?;
+    let store = Store::open(&config.data_dir).context("initialize Chime state")?;
+    if let Some(code) = store.initialize_setup_code().await? {
+        eprintln!("First-use setup code (sensitive; save it now): {code}");
+    }
+    let admin_state = admin::AdminState::new(store, &config.origin)
+        .context("initialize passkey administration")?;
 
     let listen_address = SocketAddr::from(([127, 0, 0, 1], 8080));
     let listener = TcpListener::bind(listen_address)
@@ -28,7 +56,7 @@ async fn main() -> Result<()> {
         config.origin.as_str()
     );
 
-    serve(listener, web::router())
+    serve(listener, web::router(admin_state))
         .with_graceful_shutdown(shutdown_signal())
         .await
         .context("serve HTTP requests")

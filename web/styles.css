@@ -9,18 +9,12 @@
   box-sizing: border-box;
 }
 
-body {
-  min-width: 18rem;
-  min-height: 100vh;
-  margin: 0;
-  display: grid;
-  place-items: center;
-  padding: 1.5rem;
-}
+body { min-width: 18rem; min-height: 100vh; margin: 0; padding: 1.5rem; }
 
 .page {
-  width: min(100%, 38rem);
-  padding: clamp(2rem, 7vw, 4.5rem);
+  width: min(100%, 44rem);
+  margin: 3vh auto;
+  padding: clamp(1.5rem, 6vw, 3.5rem);
   border: 1px solid #dbe4e7;
   border-radius: 1.25rem;
   background: #fff;
@@ -44,8 +38,8 @@ h1 {
 }
 
 .description {
-  max-width: 29rem;
-  margin: 1.5rem 0 2.5rem;
+  max-width: 34rem;
+  margin: 1.2rem 0 1.5rem;
   color: #52616b;
   font-size: clamp(1.1rem, 3vw, 1.4rem);
   line-height: 1.6;
@@ -67,4 +61,38 @@ h1 {
   border-radius: 50%;
   background: #2d947c;
   box-shadow: 0 0 0 0.25rem #e5f4ee;
+}
+
+.panel { margin-top: 2rem; padding-top: 1.5rem; border-top: 1px solid #dbe4e7; }
+h2 { margin: 0 0 0.65rem; font-size: 1.35rem; }
+.panel p { color: #52616b; line-height: 1.55; }
+form { display: grid; gap: 0.65rem; margin-top: 1.2rem; }
+label { font-size: 0.9rem; font-weight: 650; }
+input {
+  width: 100%; min-height: 2.8rem; padding: 0.65rem 0.75rem;
+  border: 1px solid #aebdc3; border-radius: 0.55rem; font: inherit; color: inherit;
+}
+button {
+  min-height: 2.8rem; padding: 0.6rem 1rem; border: 0; border-radius: 0.55rem;
+  background: #176a63; color: white; font: inherit; font-weight: 650; cursor: pointer;
+}
+button:hover { background: #105650; }
+button:focus-visible, input:focus-visible { outline: 3px solid #e1a33e; outline-offset: 2px; }
+button:disabled { cursor: wait; opacity: 0.65; }
+.actions { margin: 1rem 0; }
+.inline-form { display: flex; gap: 0.7rem; }
+.inline-form input { min-width: 0; }
+.passkey-list { display: grid; gap: 0.6rem; padding: 0; list-style: none; }
+.passkey-list li { display: flex; align-items: center; justify-content: space-between; gap: 0.8rem; padding: 0.75rem; border: 1px solid #dbe4e7; border-radius: 0.6rem; }
+.passkey-name { overflow-wrap: anywhere; }
+.remove-button { min-height: 2.3rem; background: #8b3232; }
+.message { min-height: 1.5rem; margin: 1rem 0 0; color: #33454e; }
+.hint { font-size: 0.9rem; }
+code { overflow-wrap: anywhere; }
+
+@media (max-width: 28rem) {
+  body { padding: 0.75rem; }
+  .page { margin: 0.75rem auto; }
+  .inline-form { display: grid; }
+  .passkey-list li { align-items: stretch; flex-direction: column; }
 }

@@ -10,8 +10,40 @@
     <main class="page">
       <p class="eyebrow">Private notifications</p>
       <h1>Chime</h1>
-      <p class="description">A small, self-hosted service for sending short messages to your devices.</p>
-      <p class="status"><span class="status-dot" aria-hidden="true"></span> This Chime server is running.</p>
+      <p class="description">Set up and manage administrator passkeys for this Chime server.</p>
+      <p class="status"><span class="status-dot" aria-hidden="true"></span><span id="server-status">Connecting to Chime…</span></p>
+
+      <section id="setup" class="panel" hidden>
+        <h2>Set up the administrator</h2>
+        <p>Enter the one time code printed by the Chime service, then register a passkey with user verification.</p>
+        <form id="setup-form">
+          <label for="setup-code">Setup code</label>
+          <input id="setup-code" name="code" type="password" autocomplete="off" required>
+          <label for="setup-name">Passkey name</label>
+          <input id="setup-name" name="name" type="text" maxlength="100" autocomplete="off" required>
+          <button type="submit">Register passkey</button>
+        </form>
+        <p id="setup-unavailable" class="hint" hidden>The code expired or was already used. An operator must stop Chime and run <code>chime-server reset-admin --data-dir PATH</code> to create another.</p>
+      </section>
+
+      <section id="admin" class="panel" hidden>
+        <h2>Administrator passkeys</h2>
+        <p>Each action asks for a fresh passkey verification. Chime does not keep an administrator session.</p>
+        <div class="actions">
+          <button id="list-passkeys" type="button">View passkeys</button>
+        </div>
+        <ul id="passkey-list" class="passkey-list" aria-label="Administrator passkeys"></ul>
+        <form id="add-form">
+          <label for="add-name">Add a passkey</label>
+          <div class="inline-form">
+            <input id="add-name" name="name" type="text" maxlength="100" autocomplete="off" placeholder="Passkey name" required>
+            <button type="submit">Add</button>
+          </div>
+        </form>
+      </section>
+
+      <p id="message" class="message" role="status" aria-live="polite"></p>
     </main>
+    <script type="module" src="/app.js"></script>
   </body>
 </html>
