@@ -82,10 +82,16 @@ button:disabled { cursor: wait; opacity: 0.65; }
 .actions { margin: 1rem 0; }
 .inline-form { display: flex; gap: 0.7rem; }
 .inline-form input { min-width: 0; }
-.passkey-list { display: grid; gap: 0.6rem; padding: 0; list-style: none; }
-.passkey-list li { display: flex; align-items: center; justify-content: space-between; gap: 0.8rem; padding: 0.75rem; border: 1px solid #dbe4e7; border-radius: 0.6rem; }
+.passkey-list, .record-list { display: grid; gap: 0.6rem; padding: 0; list-style: none; }
+.passkey-list li, .record-list li { display: flex; align-items: center; justify-content: space-between; gap: 0.8rem; padding: 0.75rem; border: 1px solid #dbe4e7; border-radius: 0.6rem; }
 .passkey-name { overflow-wrap: anywhere; }
-.remove-button { min-height: 2.3rem; background: #8b3232; }
+.remove-button, .revoke-button { min-height: 2.3rem; flex: 0 0 auto; background: #8b3232; }
+.secret-panel { margin-top: 1rem; padding: 1rem; border: 1px solid #d4a34e; border-radius: 0.6rem; background: #fff9e9; }
+.secret-panel label { display: block; margin-bottom: 0.55rem; }
+.secret-panel input { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+.record-name { display: grid; min-width: 0; gap: 0.2rem; }
+.record-name span { overflow-wrap: anywhere; }
+.record-meta { color: #687781; font-size: 0.82rem; }
 .message { min-height: 1.5rem; margin: 1rem 0 0; color: #33454e; }
 .hint { font-size: 0.9rem; }
 code { overflow-wrap: anywhere; }
@@ -94,5 +100,5 @@ code { overflow-wrap: anywhere; }
   body { padding: 0.75rem; }
   .page { margin: 0.75rem auto; }
   .inline-form { display: grid; }
-  .passkey-list li { align-items: stretch; flex-direction: column; }
+  .passkey-list li, .record-list li { align-items: stretch; flex-direction: column; }
 }

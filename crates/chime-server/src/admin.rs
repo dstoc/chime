@@ -1,5 +1,6 @@
 use crate::{
     config::Origin,
+    devices::{PushSubscription, ValidatedSubscription, validate_subscription},
     store::{
         AdminCompletion, AdminRejection, AuthenticatedOperation, PasskeyRegistrationResult, Store,
     },
@@ -72,8 +73,27 @@ enum PendingKind {
 #[derive(Clone)]
 enum AdminOperation {
     List,
-    Add { name: String },
-    Remove { credential_id: Vec<u8> },
+    Add {
+        name: String,
+    },
+    Remove {
+        credential_id: Vec<u8>,
+    },
+    ListSendKeys,
+    CreateSendKey {
+        name: String,
+    },
+    RevokeSendKey {
+        id: String,
+    },
+    ListDevices,
+    EnrollDevice {
+        name: String,
+        subscription: ValidatedSubscription,
+    },
+    RemoveDevice {
+        id: String,
+    },
 }
 
 #[derive(Debug)]
@@ -86,8 +106,27 @@ pub struct AdminError {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AdminRequest {
     ListPasskeys,
-    AddPasskey { name: String },
-    RemovePasskey { id: String },
+    AddPasskey {
+        name: String,
+    },
+    RemovePasskey {
+        id: String,
+    },
+    ListSendKeys,
+    CreateSendKey {
+        name: String,
+    },
+    RevokeSendKey {
+        id: String,
+    },
+    ListDevices,
+    EnrollDevice {
+        name: String,
+        subscription: PushSubscription,
+    },
+    RemoveDevice {
+        id: String,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -142,6 +181,22 @@ pub enum AdminResponse {
     Passkeys {
         passkeys: Vec<PasskeySummary>,
     },
+    SendKeys {
+        keys: Vec<crate::store::SendKeySummary>,
+    },
+    SendKeyCreated {
+        key: crate::store::SendKeySummary,
+        keys: Vec<crate::store::SendKeySummary>,
+        secret: String,
+    },
+    Devices {
+        devices: Vec<crate::store::ReceivingDeviceSummary>,
+    },
+    DeviceEnrolled {
+        device: crate::store::ReceivingDeviceSummary,
+        devices: Vec<crate::store::ReceivingDeviceSummary>,
+        token: String,
+    },
     AddRegistration {
         request_id: String,
         options: Box<CreationChallengeResponse>,
@@ -180,6 +235,10 @@ impl AdminState {
 
     pub fn expected_origin(&self) -> &str {
         &self.0.origin
+    }
+
+    pub fn push_public_key(&self) -> String {
+        self.0.store.vapid().public_key_base64()
     }
 
     pub async fn setup_status(&self) -> Result<SetupStatusResponse> {
@@ -266,16 +325,27 @@ impl AdminState {
                 name: validate_name(name)?,
             },
             AdminRequest::RemovePasskey { id } => {
-                let bytes = URL_SAFE_NO_PAD
-                    .decode(id)
-                    .map_err(|_| invalid_operation())?;
-                if bytes.is_empty() || bytes.len() > 1024 {
-                    return Err(invalid_operation());
-                }
+                let bytes = decode_id(&id, 1, 1024)?;
                 AdminOperation::Remove {
                     credential_id: bytes,
                 }
             }
+            AdminRequest::ListSendKeys => AdminOperation::ListSendKeys,
+            AdminRequest::CreateSendKey { name } => AdminOperation::CreateSendKey {
+                name: validate_name(name)?,
+            },
+            AdminRequest::RevokeSendKey { id } => AdminOperation::RevokeSendKey {
+                id: URL_SAFE_NO_PAD.encode(decode_id(&id, 16, 16)?),
+            },
+            AdminRequest::ListDevices => AdminOperation::ListDevices,
+            AdminRequest::EnrollDevice { name, subscription } => AdminOperation::EnrollDevice {
+                name: validate_name(name)?,
+                subscription: validate_subscription(subscription)
+                    .map_err(|_| invalid_subscription())?,
+            },
+            AdminRequest::RemoveDevice { id } => AdminOperation::RemoveDevice {
+                id: URL_SAFE_NO_PAD.encode(decode_id(&id, 16, 16)?),
+            },
         };
         self.check_challenge_budget().await?;
         let passkeys = self.0.store.passkeys().await.map_err(internal_error)?;
@@ -322,6 +392,14 @@ impl AdminState {
             AdminOperation::Remove { credential_id } => {
                 AuthenticatedOperation::Remove(credential_id)
             }
+            AdminOperation::ListSendKeys => AuthenticatedOperation::ListSendKeys,
+            AdminOperation::CreateSendKey { name } => AuthenticatedOperation::CreateSendKey(name),
+            AdminOperation::RevokeSendKey { id } => AuthenticatedOperation::RevokeSendKey(id),
+            AdminOperation::ListDevices => AuthenticatedOperation::ListDevices,
+            AdminOperation::EnrollDevice { name, subscription } => {
+                AuthenticatedOperation::EnrollDevice { name, subscription }
+            }
+            AdminOperation::RemoveDevice { id } => AuthenticatedOperation::RemoveDevice(id),
         };
         let completion = self
             .0
@@ -333,6 +411,22 @@ impl AdminState {
             AdminCompletion::Listed(passkeys) => Ok(AdminResponse::Passkeys {
                 passkeys: summaries(passkeys),
             }),
+            AdminCompletion::SendKeys(keys) => Ok(AdminResponse::SendKeys { keys }),
+            AdminCompletion::CreatedSendKey { created, keys } => {
+                Ok(AdminResponse::SendKeyCreated {
+                    key: created.key,
+                    keys,
+                    secret: created.secret,
+                })
+            }
+            AdminCompletion::Devices(devices) => Ok(AdminResponse::Devices { devices }),
+            AdminCompletion::EnrolledDevice { enrolled, devices } => {
+                Ok(AdminResponse::DeviceEnrolled {
+                    device: enrolled.device,
+                    devices,
+                    token: enrolled.token,
+                })
+            }
             AdminCompletion::Rejected(rejection) => Err(rejection_error(rejection)),
             AdminCompletion::AddAuthorized {
                 name,
@@ -494,6 +588,17 @@ fn validate_name(name: String) -> Result<String, AdminError> {
     Ok(name.to_owned())
 }
 
+fn decode_id(value: &str, min_bytes: usize, max_bytes: usize) -> Result<Vec<u8>, AdminError> {
+    let bytes = URL_SAFE_NO_PAD
+        .decode(value)
+        .map_err(|_| invalid_operation())?;
+    if bytes.len() < min_bytes || bytes.len() > max_bytes || URL_SAFE_NO_PAD.encode(&bytes) != value
+    {
+        return Err(invalid_operation());
+    }
+    Ok(bytes)
+}
+
 fn new_request_id() -> Result<String> {
     let mut bytes = [0_u8; 32];
     getrandom::fill(&mut bytes)?;
@@ -528,6 +633,13 @@ fn invalid_registration() -> AdminError {
     }
 }
 
+fn invalid_subscription() -> AdminError {
+    AdminError {
+        status: axum::http::StatusCode::BAD_REQUEST,
+        message: "The push subscription is malformed or uses an unsupported provider.",
+    }
+}
+
 fn invalid_assertion() -> AdminError {
     AdminError {
         status: axum::http::StatusCode::FORBIDDEN,
@@ -548,6 +660,22 @@ fn rejection_error(rejection: AdminRejection) -> AdminError {
         AdminRejection::PasskeyLimit => AdminError {
             status: axum::http::StatusCode::CONFLICT,
             message: "Chime can store at most 16 administrator passkeys.",
+        },
+        AdminRejection::SendKeyNotFound => AdminError {
+            status: axum::http::StatusCode::NOT_FOUND,
+            message: "That send key is no longer active.",
+        },
+        AdminRejection::SendKeyLimit => AdminError {
+            status: axum::http::StatusCode::CONFLICT,
+            message: "Chime can store at most 128 active send keys.",
+        },
+        AdminRejection::DeviceNotFound => AdminError {
+            status: axum::http::StatusCode::NOT_FOUND,
+            message: "That receiving device is no longer enrolled.",
+        },
+        AdminRejection::DeviceLimit => AdminError {
+            status: axum::http::StatusCode::CONFLICT,
+            message: "Chime can store at most 64 receiving devices.",
         },
     }
 }

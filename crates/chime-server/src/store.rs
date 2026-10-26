@@ -1,3 +1,4 @@
+use crate::devices::ValidatedSubscription;
 use crate::{data_dir, vapid::VapidIdentity};
 use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -16,10 +17,13 @@ use webauthn_rs::prelude::{AuthenticationResult, Passkey};
 
 const DATABASE_FILE: &str = "chime.sqlite3";
 const DATABASE_CONCURRENCY: usize = 4;
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 const SETUP_CODE_LIFETIME_SECONDS: i64 = 15 * 60;
 const MAX_ADMIN_PASSKEYS: usize = 16;
+const MAX_SEND_KEYS: usize = 128;
+const MAX_RECEIVING_DEVICES: usize = 64;
 
+#[derive(Clone)]
 pub struct Store {
     database: Database,
     // Loaded and checked here; later milestones consume the persistent identity for push delivery.
@@ -64,6 +68,44 @@ impl Store {
     #[allow(dead_code)]
     pub fn vapid(&self) -> &VapidIdentity {
         &self.vapid
+    }
+
+    pub async fn authorize_send(&self, secret: String) -> Result<Option<Vec<StoredSubscription>>> {
+        let digest = Sha256::digest(secret.as_bytes()).to_vec();
+        self.database
+            .run(move |connection| {
+                let transaction = connection.transaction()?;
+                let mut statement = transaction
+                    .prepare("SELECT secret_digest FROM send_keys WHERE revoked_at IS NULL")?;
+                let rows = statement.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+                let mut valid = false;
+                for row in rows {
+                    let stored = row?;
+                    valid |= stored.len() == digest.len()
+                        && bool::from(stored.as_slice().ct_eq(&digest));
+                }
+                drop(statement);
+                if !valid {
+                    transaction.commit()?;
+                    return Ok(None);
+                }
+                let subscriptions = read_subscriptions(&transaction)?;
+                transaction.commit()?;
+                Ok(Some(subscriptions))
+            })
+            .await
+    }
+
+    pub async fn remove_expired_subscription(&self, id: String, revision: i64) -> Result<bool> {
+        self.database
+            .run(move |connection| {
+                let changed = connection.execute(
+                    "DELETE FROM receiving_devices WHERE id = ?1 AND revision = ?2",
+                    params![id, revision],
+                )?;
+                Ok(changed == 1)
+            })
+            .await
     }
 
     /// Create and persist the first-use setup code once, returning it only to the foreground startup.
@@ -247,6 +289,144 @@ impl Store {
                             }
                         }
                     }
+                    AuthenticatedOperation::ListSendKeys => {
+                        AdminCompletion::SendKeys(read_send_keys(&transaction)?)
+                    }
+                    AuthenticatedOperation::CreateSendKey(name) => {
+                        let count: i64 =
+                            transaction.query_row("SELECT COUNT(*) FROM send_keys", [], |row| {
+                                row.get(0)
+                            })?;
+                        if count >= MAX_SEND_KEYS as i64 {
+                            AdminCompletion::Rejected(AdminRejection::SendKeyLimit)
+                        } else {
+                            let id = new_record_id().map_err(|error| {
+                                rusqlite::Error::ToSqlConversionFailure(Box::new(
+                                    std::io::Error::other(error.to_string()),
+                                ))
+                            })?;
+                            let mut bytes = [0_u8; 32];
+                            getrandom::fill(&mut bytes).map_err(|error| {
+                                rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+                            })?;
+                            let secret = format!("chime_sk_{}", URL_SAFE_NO_PAD.encode(bytes));
+                            let digest = Sha256::digest(secret.as_bytes()).to_vec();
+                            transaction.execute(
+                                "INSERT INTO send_keys (id, name, secret_digest, created_at)
+                                 VALUES (?1, ?2, ?3, unixepoch())",
+                                params![id, name, digest],
+                            )?;
+                            let created_at = transaction.query_row(
+                                "SELECT created_at FROM send_keys WHERE id = ?1",
+                                params![id],
+                                |row| row.get(0),
+                            )?;
+                            let key = SendKeySummary {
+                                id,
+                                name,
+                                created_at,
+                                revoked_at: None,
+                            };
+                            AdminCompletion::CreatedSendKey {
+                                created: CreatedSendKey { secret, key },
+                                keys: read_send_keys(&transaction)?,
+                            }
+                        }
+                    }
+                    AuthenticatedOperation::RevokeSendKey(id) => {
+                        let removed = transaction.execute(
+                            "UPDATE send_keys SET revoked_at = unixepoch()
+                             WHERE id = ?1 AND revoked_at IS NULL",
+                            params![id],
+                        )?;
+                        if removed == 0 {
+                            AdminCompletion::Rejected(AdminRejection::SendKeyNotFound)
+                        } else {
+                            AdminCompletion::SendKeys(read_send_keys(&transaction)?)
+                        }
+                    }
+                    AuthenticatedOperation::ListDevices => {
+                        AdminCompletion::Devices(read_devices(&transaction)?)
+                    }
+                    AuthenticatedOperation::EnrollDevice { name, subscription } => {
+                        let token = generate_secret("chime_dt_").map_err(|error| {
+                            rusqlite::Error::ToSqlConversionFailure(Box::new(
+                                std::io::Error::other(error.to_string()),
+                            ))
+                        })?;
+                        let token_digest = Sha256::digest(token.as_bytes()).to_vec();
+                        let existing_id: Option<String> = transaction
+                            .query_row(
+                                "SELECT id FROM receiving_devices WHERE endpoint = ?1",
+                                params![subscription.endpoint],
+                                |row| row.get(0),
+                            )
+                            .optional()?;
+                        let id = if let Some(id) = existing_id {
+                            transaction.execute(
+                                "UPDATE receiving_devices
+                                 SET name = ?1, p256dh = ?2, auth = ?3, token_digest = ?4,
+                                     updated_at = unixepoch(), revision = revision + 1
+                                 WHERE id = ?5",
+                                params![
+                                    name,
+                                    subscription.p256dh,
+                                    subscription.auth,
+                                    token_digest,
+                                    id
+                                ],
+                            )?;
+                            id
+                        } else {
+                            let count: i64 = transaction.query_row(
+                                "SELECT COUNT(*) FROM receiving_devices",
+                                [],
+                                |row| row.get(0),
+                            )?;
+                            if count >= MAX_RECEIVING_DEVICES as i64 {
+                                return Ok(AdminCompletion::Rejected(AdminRejection::DeviceLimit));
+                            }
+                            let id = new_record_id().map_err(|error| {
+                                rusqlite::Error::ToSqlConversionFailure(Box::new(
+                                    std::io::Error::other(error.to_string()),
+                                ))
+                            })?;
+                            transaction.execute(
+                                "INSERT INTO receiving_devices
+                                 (id, name, endpoint, p256dh, auth, token_digest,
+                                  created_at, updated_at, revision)
+                                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, unixepoch(), unixepoch(), 1)",
+                                params![
+                                    id,
+                                    name,
+                                    subscription.endpoint,
+                                    subscription.p256dh,
+                                    subscription.auth,
+                                    token_digest
+                                ],
+                            )?;
+                            id
+                        };
+                        let device = transaction.query_row(
+                            "SELECT id, name, created_at, updated_at
+                             FROM receiving_devices WHERE id = ?1",
+                            params![id],
+                            read_device_summary,
+                        )?;
+                        AdminCompletion::EnrolledDevice {
+                            enrolled: EnrolledDevice { token, device },
+                            devices: read_devices(&transaction)?,
+                        }
+                    }
+                    AuthenticatedOperation::RemoveDevice(id) => {
+                        let removed = transaction
+                            .execute("DELETE FROM receiving_devices WHERE id = ?1", params![id])?;
+                        if removed == 0 {
+                            AdminCompletion::Rejected(AdminRejection::DeviceNotFound)
+                        } else {
+                            AdminCompletion::Devices(read_devices(&transaction)?)
+                        }
+                    }
                 };
                 transaction.commit()?;
                 Ok(completion)
@@ -379,15 +559,69 @@ pub struct AdminPasskey {
     pub passkey: Passkey,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SendKeySummary {
+    pub id: String,
+    pub name: String,
+    pub created_at: i64,
+    pub revoked_at: Option<i64>,
+}
+
+pub struct CreatedSendKey {
+    pub secret: String,
+    pub key: SendKeySummary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ReceivingDeviceSummary {
+    pub id: String,
+    pub name: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+pub struct EnrolledDevice {
+    pub token: String,
+    pub device: ReceivingDeviceSummary,
+}
+
+#[derive(Debug, Clone)]
+pub struct StoredSubscription {
+    pub id: String,
+    pub endpoint: String,
+    pub p256dh: String,
+    pub auth: String,
+    pub revision: i64,
+}
+
 pub enum AuthenticatedOperation {
     List,
     Add(String),
     Remove(Vec<u8>),
+    ListSendKeys,
+    CreateSendKey(String),
+    RevokeSendKey(String),
+    ListDevices,
+    EnrollDevice {
+        name: String,
+        subscription: ValidatedSubscription,
+    },
+    RemoveDevice(String),
 }
 
 pub enum AdminCompletion {
     Listed(Vec<AdminPasskey>),
     Rejected(AdminRejection),
+    SendKeys(Vec<SendKeySummary>),
+    CreatedSendKey {
+        created: CreatedSendKey,
+        keys: Vec<SendKeySummary>,
+    },
+    Devices(Vec<ReceivingDeviceSummary>),
+    EnrolledDevice {
+        enrolled: EnrolledDevice,
+        devices: Vec<ReceivingDeviceSummary>,
+    },
     AddAuthorized {
         name: String,
         authorizer_id: Vec<u8>,
@@ -399,6 +633,10 @@ pub enum AdminRejection {
     LastPasskey,
     PasskeyNotFound,
     PasskeyLimit,
+    SendKeyNotFound,
+    SendKeyLimit,
+    DeviceNotFound,
+    DeviceLimit,
 }
 
 pub enum PasskeyRegistrationResult {
@@ -487,6 +725,7 @@ fn initialize_schema(connection: &mut Connection) -> Result<()> {
                 apply_migration_one(&transaction, &vapid)?;
             }
             1 => apply_migration_two(&transaction)?,
+            2 => apply_migration_three(&transaction)?,
             version => bail!("no database migration is available after version {version}"),
         }
         transaction.commit()?;
@@ -518,6 +757,94 @@ fn apply_migration_two(transaction: &Transaction<'_>) -> Result<()> {
         INSERT INTO schema_migrations (version, applied_at) VALUES (2, unixepoch());",
     )?;
     Ok(())
+}
+
+fn apply_migration_three(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        "CREATE TABLE send_keys (
+            id TEXT PRIMARY KEY CHECK (length(id) = 22),
+            name TEXT NOT NULL CHECK (length(name) BETWEEN 1 AND 100),
+            secret_digest BLOB NOT NULL CHECK (length(secret_digest) = 32),
+            created_at INTEGER NOT NULL,
+            revoked_at INTEGER
+        );
+        CREATE TABLE receiving_devices (
+            id TEXT PRIMARY KEY CHECK (length(id) = 22),
+            name TEXT NOT NULL CHECK (length(name) BETWEEN 1 AND 100),
+            endpoint TEXT NOT NULL UNIQUE CHECK (length(endpoint) BETWEEN 1 AND 2048),
+            p256dh TEXT NOT NULL,
+            auth TEXT NOT NULL,
+            token_digest BLOB NOT NULL CHECK (length(token_digest) = 32),
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            revision INTEGER NOT NULL CHECK (revision > 0)
+        );
+        CREATE INDEX send_keys_active_idx ON send_keys (revoked_at);
+        INSERT INTO schema_migrations (version, applied_at) VALUES (3, unixepoch());",
+    )?;
+    Ok(())
+}
+
+fn read_send_keys(connection: &Connection) -> rusqlite::Result<Vec<SendKeySummary>> {
+    let mut statement = connection.prepare(
+        "SELECT id, name, created_at, revoked_at FROM send_keys ORDER BY created_at, id",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok(SendKeySummary {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            created_at: row.get(2)?,
+            revoked_at: row.get(3)?,
+        })
+    })?;
+    rows.collect()
+}
+
+fn read_devices(connection: &Connection) -> rusqlite::Result<Vec<ReceivingDeviceSummary>> {
+    let mut statement = connection.prepare(
+        "SELECT id, name, created_at, updated_at
+         FROM receiving_devices ORDER BY created_at, id",
+    )?;
+    let rows = statement.query_map([], read_device_summary)?;
+    rows.collect()
+}
+
+fn read_device_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReceivingDeviceSummary> {
+    Ok(ReceivingDeviceSummary {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        created_at: row.get(2)?,
+        updated_at: row.get(3)?,
+    })
+}
+
+fn read_subscriptions(connection: &Connection) -> rusqlite::Result<Vec<StoredSubscription>> {
+    let mut statement = connection.prepare(
+        "SELECT id, endpoint, p256dh, auth, revision
+         FROM receiving_devices ORDER BY created_at, id",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok(StoredSubscription {
+            id: row.get(0)?,
+            endpoint: row.get(1)?,
+            p256dh: row.get(2)?,
+            auth: row.get(3)?,
+            revision: row.get(4)?,
+        })
+    })?;
+    rows.collect()
+}
+
+fn new_record_id() -> Result<String> {
+    let mut bytes = [0_u8; 16];
+    getrandom::fill(&mut bytes).context("generate record ID")?;
+    Ok(URL_SAFE_NO_PAD.encode(bytes))
+}
+
+fn generate_secret(prefix: &str) -> Result<String> {
+    let mut bytes = [0_u8; 32];
+    getrandom::fill(&mut bytes).context("generate bearer secret")?;
+    Ok(format!("{prefix}{}", URL_SAFE_NO_PAD.encode(bytes)))
 }
 
 fn read_passkeys(connection: &Connection) -> rusqlite::Result<Vec<AdminPasskey>> {
@@ -642,7 +969,7 @@ mod tests {
     use super::{Database, Store, apply_migration_one_with_keys, configure_connection};
     use crate::vapid::VapidIdentity;
     use anyhow::{Context, Result};
-    use rusqlite::{Connection, TransactionBehavior};
+    use rusqlite::{Connection, TransactionBehavior, params};
     use std::{
         path::Path,
         sync::{
@@ -738,7 +1065,98 @@ mod tests {
                 })
             })
             .await?;
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sender_keys_are_digested_and_revoked_independently() -> Result<()> {
+        use sha2::{Digest, Sha256};
+
+        let root = tempfile::tempdir()?;
+        let store = Store::open(&root.path().join("state"))?;
+        let first = "chime_sk_first-test-secret".to_owned();
+        let second = "chime_sk_second-test-secret".to_owned();
+        let first_digest = Sha256::digest(first.as_bytes()).to_vec();
+        let second_digest = Sha256::digest(second.as_bytes()).to_vec();
+        store
+            .database()
+            .run(move |connection| {
+                connection.execute(
+                    "INSERT INTO send_keys (id, name, secret_digest, created_at)
+                     VALUES ('AAAAAAAAAAAAAAAAAAAAAA', 'first', ?1, unixepoch())",
+                    params![first_digest],
+                )?;
+                connection.execute(
+                    "INSERT INTO send_keys (id, name, secret_digest, created_at)
+                     VALUES ('BBBBBBBBBBBBBBBBBBBBBB', 'second', ?1, unixepoch())",
+                    params![second_digest],
+                )?;
+                Ok(())
+            })
+            .await?;
+
+        let stored = store
+            .database()
+            .run(|connection| {
+                connection.query_row(
+                    "SELECT secret_digest FROM send_keys WHERE name = 'first'",
+                    [],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )
+            })
+            .await?;
+        assert_eq!(stored, Sha256::digest(first.as_bytes()).to_vec());
+        assert_ne!(stored, first.as_bytes());
+        assert!(store.authorize_send(first.clone()).await?.is_some());
+        assert!(store.authorize_send(second.clone()).await?.is_some());
+
+        store
+            .database()
+            .run(|connection| {
+                connection.execute(
+                    "UPDATE send_keys SET revoked_at = unixepoch()
+                     WHERE id = 'AAAAAAAAAAAAAAAAAAAAAA'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await?;
+        assert!(store.authorize_send(first).await?.is_none());
+        assert!(store.authorize_send(second).await?.is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn old_provider_expiry_cannot_remove_a_rotated_device_record() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store = Store::open(&root.path().join("state"))?;
+        store
+            .database()
+            .run(|connection| {
+                connection.execute(
+                    "INSERT INTO receiving_devices
+                     (id, name, endpoint, p256dh, auth, token_digest,
+                      created_at, updated_at, revision)
+                     VALUES ('CCCCCCCCCCCCCCCCCCCCCC', 'phone',
+                       'https://fcm.googleapis.com/fcm/send/test', 'public', 'auth',
+                       zeroblob(32), unixepoch(), unixepoch(), 2)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await?;
+
+        assert!(
+            !store
+                .remove_expired_subscription("CCCCCCCCCCCCCCCCCCCCCC".to_owned(), 1)
+                .await?
+        );
+        assert!(
+            store
+                .remove_expired_subscription("CCCCCCCCCCCCCCCCCCCCCC".to_owned(), 2)
+                .await?
+        );
         Ok(())
     }
 
@@ -859,10 +1277,22 @@ mod tests {
             .database()
             .run(|connection| {
                 connection.execute_batch(
-                    "CREATE TABLE send_keys (id INTEGER PRIMARY KEY, value TEXT);
-                     CREATE TABLE subscriptions (id INTEGER PRIMARY KEY, value TEXT);",
+                    "CREATE TABLE subscriptions (id INTEGER PRIMARY KEY, value TEXT);",
                 )?;
-                connection.execute("INSERT INTO send_keys (id, value) VALUES (1, 'keep')", [])?;
+                connection.execute(
+                    "INSERT INTO send_keys (id, name, secret_digest, created_at)
+                     VALUES ('AAAAAAAAAAAAAAAAAAAAAA', 'keep', zeroblob(32), unixepoch())",
+                    [],
+                )?;
+                connection.execute(
+                    "INSERT INTO receiving_devices
+                     (id, name, endpoint, p256dh, auth, token_digest,
+                      created_at, updated_at, revision)
+                     VALUES ('BBBBBBBBBBBBBBBBBBBBBB', 'keep',
+                       'https://fcm.googleapis.com/fcm/send/keep', 'public', 'auth',
+                       zeroblob(32), unixepoch(), unixepoch(), 1)",
+                    [],
+                )?;
                 connection.execute(
                     "INSERT INTO subscriptions (id, value) VALUES (1, 'keep')",
                     [],
@@ -893,13 +1323,14 @@ mod tests {
             .run(|connection| {
                 let keys: i64 =
                     connection.query_row("SELECT COUNT(*) FROM send_keys", [], |row| row.get(0))?;
-                let subscriptions: i64 =
-                    connection
-                        .query_row("SELECT COUNT(*) FROM subscriptions", [], |row| row.get(0))?;
+                let devices: i64 =
+                    connection.query_row("SELECT COUNT(*) FROM receiving_devices", [], |row| {
+                        row.get(0)
+                    })?;
                 let passkeys: i64 =
                     connection
                         .query_row("SELECT COUNT(*) FROM admin_passkeys", [], |row| row.get(0))?;
-                Ok((keys, subscriptions, passkeys))
+                Ok((keys, devices, passkeys))
             })
             .await?;
         assert_eq!(preserved, (1, 1, 0));

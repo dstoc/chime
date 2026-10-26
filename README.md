@@ -1,6 +1,6 @@
 # Chime
 
-Chime is a small, self-hosted notification service. This milestone provides first-use administrator setup and passkey administration. Sending notifications and enrolling receiving devices are not available yet.
+Chime sends short text notifications from a command line to browsers that you enroll. Administrators use passkeys to manage receiving devices and independently revocable send keys. Chime stores only key and device-token digests; it does not keep a notification history.
 
 ## Run the server
 
@@ -18,6 +18,33 @@ On the first start, Chime prints a random setup code to the foreground console. 
 
 Every passkey list, add, or remove action requires a new passkey verification with user verification. Adding a passkey requires one verification to authorize the registration and a second to register it. Chime does not create administrator cookies or sessions. Keep at least one passkey registered.
 
+## Enroll a browser and send a notification
+
+Open Chime in a supported browser over HTTPS. On each receiving browser, choose **Enable notifications**, allow notifications, enter a device name, and approve enrollment with a passkey. On iPhone or iPad, first add Chime to the Home Screen and open that app. Chime does not use polling when push notifications are unavailable.
+
+Create a named send key in the browser. Chime shows its value once. Store it in a protected config file or environment variable. Do not put the key in a command argument.
+
+Create `~/.config/chime/config.json` with mode `0600`:
+
+```json
+{
+  "server_url": "https://chime.example-tailnet.ts.net",
+  "api_key": "PASTE_THE_NEW_KEY_HERE"
+}
+```
+
+Set the file permissions with `chmod 600 ~/.config/chime/config.json` after you save it.
+
+Send text to all active receiving devices:
+
+```sh
+chime send --title 'Build completed' --body 'All checks passed'
+```
+
+The CLI also reads `CHIME_URL` and `CHIME_API_KEY`; environment values override the config file. Use `--config PATH` or `CHIME_CONFIG` to select a different file. The CLI reports push-provider acceptance, not device receipt, and exits with a nonzero status for partial failure, total failure, or no devices.
+
+The browser provides send-key creation and revocation, device enrollment and removal, and administrator passkey management. Enrollment accepts HTTPS push endpoints from Google FCM, Mozilla Push, and Apple Web Push. Other providers are rejected. The send API accepts JSON with a required `title` (up to 200 UTF-8 bytes) and optional `body` (up to 1,500 bytes). Chime supports up to 64 receiving devices, keeps provider messages for one hour, and limits the server to 60 sends per minute, four sends at once, and eight provider requests at once. Images, click URLs, and cross-origin web-app sending are not part of this milestone.
+
 If the setup code expires or is lost, or if initial registration was cancelled after setup began, stop Chime and replace the code locally:
 
 ```sh
@@ -26,7 +53,7 @@ chime-server reset-admin --data-dir /var/lib/chime
 
 The command requires the exclusive data-directory lock and refuses to run while Chime is using that directory. It clears administrator passkeys and prints a new 15-minute setup code. It preserves send keys, device subscriptions, and the VAPID identity; revoke send keys separately if compromise is suspected.
 
-Chime creates the data directory with private permissions on Unix systems. SQLite stores the persistent VAPID key pair and uses forward schema migrations. The server holds an exclusive data-directory lock for its lifetime, and `reset-admin` must acquire the same lock. The current database has no notification history.
+Chime creates the data directory with private permissions on Unix systems. SQLite stores the persistent VAPID key pair, send-key digests, and device subscriptions and token digests. It uses forward schema migrations. The server holds an exclusive data-directory lock for its lifetime, and `reset-admin` must acquire the same lock. The database has no notification history.
 
 ## Development checks
 
