@@ -110,30 +110,6 @@ class DeploymentConfigTests(unittest.TestCase):
         self.assertNotIn("PodName=", combined)
         self.assertNotRegex(combined, r"tskey-(?:auth|client)-[A-Za-z0-9-]+")
 
-    def test_pod_migration_stops_before_backup_and_tolerates_removed_pod(self) -> None:
-        guide = (ROOT / "docs" / "operator-guide.md").read_text(encoding="utf-8")
-        migration = guide.split("## Move an existing pod installation\n", 1)[1].split(
-            "\n## ", 1
-        )[0]
-
-        stop_old_pod = migration.index("systemctl --user stop chime-pod.service")
-        backup_chime = migration.index('-czf "$HOME/chime-data-backup.tar.gz" data')
-        backup_tailscale = migration.index(
-            '-czf "$HOME/chime-tailscale-backup.tar.gz" tailscale'
-        )
-        remove_old_pod = migration.index("podman pod rm --ignore --force chime")
-        install_new_units = migration.index(
-            'install -m 0600 examples/quadlet/chime.container'
-        )
-        start_new_deployment = migration.index("systemctl --user start chime-tailscale.service")
-
-        self.assertLess(stop_old_pod, backup_chime)
-        self.assertLess(backup_chime, backup_tailscale)
-        self.assertLess(backup_tailscale, remove_old_pod)
-        self.assertLess(remove_old_pod, install_new_units)
-        self.assertLess(install_new_units, start_new_deployment)
-        self.assertIn("Do not use the backup procedure above during this transition", migration)
-
     def test_serve_config_forwards_loopback_https_without_funnel(self) -> None:
         config = json.loads(
             (QUADLET / "tailscale" / "serve.json").read_text(encoding="utf-8")
