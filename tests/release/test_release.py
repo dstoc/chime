@@ -99,7 +99,8 @@ class ReleaseConfigurationTests(unittest.TestCase):
         self.assertIn("branches: [main]", workflow)
         self.assertIn("workflow_dispatch:", workflow)
         self.assertIn("SELECTED_REF", workflow)
-        self.assertIn('refs/tags/$TAG', workflow)
+        self.assertIn('refs/heads/main', workflow)
+        self.assertIn('git rev-parse --verify "$TAG^{commit}"', workflow)
         self.assertIn("concurrency:", workflow)
         self.assertIn("group: chime-release", workflow)
         self.assertIn("cancel-in-progress: false", workflow)
@@ -117,7 +118,13 @@ class ReleaseConfigurationTests(unittest.TestCase):
         self.assertIn("cmp --silent", workflow)
         self.assertIn("already contains", workflow)
 
-        self.assertLess(workflow.index("releases/tags/$TAG"), workflow.index("docker/build-push-action@v6"))
+        self.assertNotIn("releases/tags/$TAG", workflow)
+        self.assertNotIn('gh release download', workflow)
+        self.assertNotIn('gh release upload', workflow)
+        self.assertNotIn('gh release edit', workflow)
+        self.assertIn("releases?per_page=100", workflow)
+        self.assertIn("uploads.github.com", workflow)
+        self.assertLess(workflow.index("releases?per_page=100"), workflow.index("docker/build-push-action@v6"))
         self.assertLess(workflow.index("docker/build-push-action@v6"), workflow.index("actions/attest@v4"))
         self.assertLess(workflow.index("gh attestation verify"), workflow.index("draft=false"))
         self.assertLess(
@@ -128,6 +135,21 @@ class ReleaseConfigurationTests(unittest.TestCase):
             workflow.index("Synchronize the release PR Cargo.lock"),
             workflow.index("Export release outputs"),
         )
+
+    def test_draft_release_lookup_rejects_missing_or_published_releases(self) -> None:
+        script = workflow_run_script("Verify draft, source, and shared workspace version")
+        self.assertIn("releases?per_page=100", script)
+        self.assertIn("length) == 1", script)
+        self.assertIn("$matches[0].draft == true", script)
+        self.assertIn("$matches[0].published_at == null", script)
+        self.assertIn("releases/$release_id", script)
+
+    def test_recovery_uses_current_main_workflow_and_tagged_source(self) -> None:
+        script = workflow_run_script("Validate the selected draft tag")
+        self.assertIn('refs/heads/main', script)
+        self.assertIn('git rev-parse --verify "$TAG^{commit}"', script)
+        self.assertIn('git merge-base --is-ancestor "$source_sha" HEAD', script)
+        self.assertIn('echo "source_sha=$source_sha"', script)
 
     def test_quadlet_and_operator_docs_use_published_images(self) -> None:
         unit = (ROOT / "examples" / "quadlet" / "chime.container").read_text()
