@@ -18,7 +18,7 @@ Release Please runs on pushes to `main`. It opens or updates one release pull re
 
 The same workflow run checks out the tag, builds the Linux AMD64 image and Linux x86-64 GNU CLI, attaches the CLI archive and checksum, records the image digest, creates and verifies Artifact Attestations, tests the CLI in a clean Debian runtime, and anonymously pulls and starts the image. It publishes the GitHub release only after these checks pass. It does not rely on a second workflow triggered by the token-created release.
 
-If a workflow fails, the GitHub release remains a draft. A GHCR image can already be public if a later step failed. After merging a workflow fix, use **Run workflow** with **`main`** selected as the workflow ref and the existing `v<version>` tag entered as input (for example `v0.2.0`). This executes the updated workflow while checking out the original release tag as the immutable build source. It does not move the tag or create a second release. Recovery accepts only the matching draft. It reuses an existing GHCR tag only if its provenance verifies for this repository, release workflow, and tagged source. It reuses a release asset only if its bytes match the deterministic local artifact. It fails without overwriting a mismatched image or asset. A published release is terminal and cannot be used for recovery.
+If a workflow fails, the GitHub release remains a draft. A GHCR image can already be public if a later step failed. After merging a workflow fix, use **Run workflow** with **`main`** selected as the workflow ref and the existing `v<version>` tag entered as input (for example `v0.2.0`). This executes the updated workflow while checking out the original release tag as the immutable build source. It does not move the tag or create a second release. Recovery accepts only the matching draft. It reuses an existing GHCR tag only if its attestation verifies for this repository and the release workflow on `main`. GitHub's generated attestation source digest identifies the workflow execution commit, which can differ from the checked-out release tag during recovery. The workflow separately checks that the release tag resolves to the expected source commit. Existing CLI archives must also match a freshly built archive byte-for-byte. It reuses a release asset only if its bytes match the deterministic local artifact. It fails without overwriting a mismatched image or asset. A published release is terminal and cannot be used for recovery.
 
 ## Download and verify a CLI
 
@@ -31,14 +31,14 @@ gh release download "v${VERSION}" --repo dstoc/chime --pattern "$ARCHIVE" --patt
 sha256sum --check "$ARCHIVE.sha256"
 ```
 
-The release notes record the source commit. Verify the archive against that commit and this repository's release workflow:
+The release notes record the release source commit. GitHub's generated attestation instead identifies the workflow execution commit; verify the archive's trusted repository and release workflow on `main`:
 
 ```sh
 SOURCE_SHA=<40-character-source-commit-from-release-notes>
 gh attestation verify "$ARCHIVE" \
   --repo dstoc/chime \
   --signer-workflow dstoc/chime/.github/workflows/release.yml \
-  --source-digest "$SOURCE_SHA"
+  --source-ref refs/heads/main
 ```
 
 The archive contains the `chime` executable and `LICENSE`. Confirm its embedded version with `./chime --version`. The release build targets x86-64 Linux GNU. It needs the runtime libraries used by the Debian 12 image: glibc, libgcc, OpenSSL 3, zlib, and zstd. Use a compatible Linux distribution or install the matching runtime packages.
@@ -53,15 +53,15 @@ IMAGE_DIGEST=sha256:<digest-from-release-notes>
 podman pull "ghcr.io/dstoc/chime@${IMAGE_DIGEST}"
 ```
 
-Verify the GitHub Artifact Attestation for the image digest. This command fetches the bundle from GHCR and checks the expected repository, workflow, and source commit:
+Verify the GitHub Artifact Attestation for the image digest. This command fetches the bundle from GHCR and checks the expected repository, workflow, and workflow source ref:
 
 ```sh
 SOURCE_SHA=<40-character-source-commit-from-release-notes>
 gh attestation verify "oci://ghcr.io/dstoc/chime@${IMAGE_DIGEST}" \
   --repo dstoc/chime \
   --signer-workflow dstoc/chime/.github/workflows/release.yml \
-  --source-digest "$SOURCE_SHA" \
+  --source-ref refs/heads/main \
   --bundle-from-oci
 ```
 
-The release workflow refuses to overwrite a version tag it finds in GHCR. It stops if a pre-existing image does not have valid provenance for the expected tagged source. GHCR tags remain mutable outside this workflow; use the recorded digest for deployment pinning and restrict package write access.
+The release workflow refuses to overwrite a version tag it finds in GHCR. It stops if a pre-existing image does not have valid provenance for the expected release workflow ref. GHCR tags remain mutable outside this workflow; use the recorded digest for deployment pinning and restrict package write access.
