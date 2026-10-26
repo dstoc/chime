@@ -193,6 +193,17 @@ class ReleaseConfigurationTests(unittest.TestCase):
             )
             self.assertIn("Authorization: Bearer test-token", args)
 
+    def test_release_notes_and_publish_preserve_tag(self) -> None:
+        notes = workflow_run_script("Update draft notes with verified artifact identities")
+        publish = workflow_run_script("Publish the complete verified release")
+        for script in (notes, publish):
+            self.assertIn('--raw-field "tag_name=$TAG"', script)
+            self.assertIn('.tag_name == $tag', script)
+            self.assertIn('.published_at', script)
+        self.assertIn('updated_release=$(gh api --method PATCH', notes)
+        self.assertIn('published_release=$(gh api --method PATCH', publish)
+        self.assertIn('.draft == false and .published_at != null', publish)
+
     def test_draft_release_lookup_rejects_missing_or_published_releases(self) -> None:
         script = workflow_run_script("Verify draft, source, and shared workspace version")
         self.assertIn("releases?per_page=100", script)
