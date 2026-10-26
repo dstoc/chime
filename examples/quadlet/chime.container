@@ -1,11 +1,13 @@
 [Unit]
 Description=Chime notification server
+After=chime-tailscale.service
+BindsTo=chime-tailscale.service
+PartOf=chime-tailscale.service
 
 [Container]
 Image=chime.build
 ContainerName=chime-server
-Pod=chime.pod
-StartWithPod=true
+Network=chime-tailscale.container
 User=10001:10001
 ReadOnly=true
 ReadOnlyTmpfs=true

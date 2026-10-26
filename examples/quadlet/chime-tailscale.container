@@ -1,11 +1,10 @@
 [Unit]
 Description=Tailscale Serve sidecar for Chime
+Wants=chime.service
 
 [Container]
 Image=docker.io/tailscale/tailscale:v1.102.4
 ContainerName=chime-tailscale
-Pod=chime.pod
-StartWithPod=true
 Environment=TS_HOSTNAME=chime
 Environment=TS_USERSPACE=true
 Environment=TS_STATE_DIR=/var/lib/tailscale

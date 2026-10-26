@@ -38,13 +38,21 @@ class DeploymentConfigTests(unittest.TestCase):
         self.assertEqual(unit["Build"]["SetWorkingDirectory"], "%h/src/chime")
         self.assertEqual(unit["Service"]["TimeoutStartSec"], "900")
 
-    def test_chime_is_non_root_read_only_and_stays_in_the_pod(self) -> None:
+    def test_chime_joins_tailscale_namespace_and_restarts_with_it(self) -> None:
         unit = read_unit("chime.container")
         container = unit["Container"]
 
         self.assertEqual(container["Image"], "chime.build")
-        self.assertEqual(container["Pod"], "chime.pod")
-        self.assertEqual(container["StartWithPod"], "true")
+        self.assertEqual(container["Network"], "chime-tailscale.container")
+        self.assertEqual(
+            set(unit["Unit"]["After"].split()), {"chime-tailscale.service"}
+        )
+        self.assertEqual(
+            set(unit["Unit"]["BindsTo"].split()), {"chime-tailscale.service"}
+        )
+        self.assertEqual(
+            set(unit["Unit"]["PartOf"].split()), {"chime-tailscale.service"}
+        )
         self.assertEqual(container["User"], "10001:10001")
         self.assertEqual(container["ReadOnly"], "true")
         self.assertEqual(container["ReadOnlyTmpfs"], "true")
@@ -54,8 +62,9 @@ class DeploymentConfigTests(unittest.TestCase):
         self.assertNotIn("/var/run/tailscale", container["Volume"])
         self.assertNotIn("Secret=", (QUADLET / "chime.container").read_text(encoding="utf-8"))
         self.assertEqual(unit["Service"]["Restart"], "always")
+        self.assertFalse((QUADLET / "chime.pod").exists())
 
-    def test_tailscale_uses_file_secret_persistent_state_and_pod_loopback(self) -> None:
+    def test_tailscale_uses_file_secret_persistent_state_and_starts_chime(self) -> None:
         unit = read_unit("chime-tailscale.container")
         container = unit["Container"]
 
@@ -63,8 +72,7 @@ class DeploymentConfigTests(unittest.TestCase):
             container["Image"],
             r"^docker\.io/tailscale/tailscale:v\d+\.\d+\.\d+$",
         )
-        self.assertEqual(container["Pod"], "chime.pod")
-        self.assertEqual(container["StartWithPod"], "true")
+        self.assertEqual(set(unit["Unit"]["Wants"].split()), {"chime.service"})
         self.assertEqual(container["Environment"], "TS_SERVE_CONFIG=/config/serve.json")
         lines = (QUADLET / "chime-tailscale.container").read_text(encoding="utf-8").splitlines()
         for required in (
@@ -80,12 +88,11 @@ class DeploymentConfigTests(unittest.TestCase):
         self.assertTrue(any("/config:ro,Z" in line for line in lines))
         self.assertEqual(unit["Service"]["Restart"], "always")
 
-    def test_pod_and_containers_do_not_publish_or_gain_host_privileges(self) -> None:
+    def test_two_containers_do_not_publish_or_gain_host_privileges(self) -> None:
         unit_files = [
             QUADLET / "chime.build",
             QUADLET / "chime.container",
             QUADLET / "chime-tailscale.container",
-            QUADLET / "chime.pod",
         ]
         combined = "\n".join(path.read_text(encoding="utf-8") for path in unit_files)
         for forbidden in (
@@ -98,11 +105,10 @@ class DeploymentConfigTests(unittest.TestCase):
             "/run/podman/podman.sock",
         ):
             self.assertNotIn(forbidden, combined)
-        self.assertIn("PodName=chime", combined)
+        self.assertNotIn("Pod=", combined)
+        self.assertNotIn("StartWithPod=", combined)
+        self.assertNotIn("PodName=", combined)
         self.assertNotRegex(combined, r"tskey-(?:auth|client)-[A-Za-z0-9-]+")
-        pod = read_unit("chime.pod")
-        self.assertEqual(pod["Pod"]["PodName"], "chime")
-        self.assertEqual(pod["Service"]["Restart"], "always")
 
     def test_serve_config_forwards_loopback_https_without_funnel(self) -> None:
         config = json.loads(
