@@ -210,6 +210,15 @@ authenticatorId = (await cdp('WebAuthn.addVirtualAuthenticator', {
 })).authenticatorId;
 await cdp('Page.navigate', { url: origin });
 await waitFor((state) => state.setupHidden === false);
+const appManifest = await cdp('Page.getAppManifest');
+const manifestData = appManifest.data ? JSON.parse(appManifest.data) : null;
+if (appManifest.url !== `${origin}/manifest.webmanifest`
+  || appManifest.errors.length !== 0
+  || manifestData?.display !== 'standalone'
+  || !manifestData.icons?.some((icon) => icon.src === '/icons/chime-192.png' && icon.sizes === '192x192')
+  || !manifestData.icons?.some((icon) => icon.src === '/icons/chime-512.png' && icon.sizes === '512x512')) {
+  throw new Error(`browser did not load the standalone manifest and icon metadata under CSP: ${JSON.stringify(appManifest)}`);
+}
 const invalidSetup = await evaluate(`(async () => {
   const response = await fetch('/api/setup/start', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({code:'wrong-code',name:'QA key'}) });
   return response.status;
@@ -319,16 +328,76 @@ const invalidSubscription = await evaluate(`(async () => {
 })()`);
 if (invalidSubscription !== 400) throw new Error(`unsupported provider endpoint returned ${invalidSubscription}`);
 
+await cdp('Browser.grantPermissions', { origin, permissions: ['notifications'] });
+const uiEnrollment = await evaluate(`(async () => {
+  const subscription = ${JSON.stringify(testSubscription)};
+  const originalRegister = navigator.serviceWorker.register.bind(navigator.serviceWorker);
+  navigator.serviceWorker.register = async (...args) => {
+    navigator.serviceWorker.register = originalRegister;
+    const registration = await originalRegister(...args);
+    const pushManager = {
+      getSubscription: async () => null,
+      subscribe: async () => ({ toJSON: () => structuredClone(subscription) }),
+    };
+    return new Proxy(registration, {
+      get(target, property) {
+        if (property === 'pushManager') return pushManager;
+        return Reflect.get(target, property, target);
+      },
+    });
+  };
+  const originalFetch = window.fetch.bind(window);
+  window.fetch = async (...args) => {
+    if (new URL(args[0], location.href).pathname === '/api/admin/challenge') {
+      window.qaDeviceEnrollmentRequest = JSON.parse(args[1].body);
+    }
+    return originalFetch(...args);
+  };
+  document.querySelector('#device-name').value = 'My browser';
+  document.querySelector('#device-form').requestSubmit();
+  const end = Date.now() + 10000;
+  while (Date.now() < end) {
+    const status = document.querySelector('#device-status').textContent;
+    if (!document.querySelector('#enable-notifications').disabled
+      && status !== 'Choose Allow when the browser asks to send notifications.') break;
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+  const tokens = await import('/device-token.js');
+  return {
+    request: window.qaDeviceEnrollmentRequest || null,
+    status: document.querySelector('#device-status').textContent,
+    message: document.querySelector('#message').textContent,
+    token: await tokens.getDeviceCredentials(),
+  };
+})()`);
+if (uiEnrollment.request?.name !== 'My browser'
+  || uiEnrollment.request?.kind !== 'enroll_device'
+  || uiEnrollment.status !== 'This browser is enrolled. Its private device token is stored in this site\'s IndexedDB.'
+  || !uiEnrollment.token?.device_id
+  || !uiEnrollment.token?.token) {
+  throw new Error(`Enable notifications did not submit the device name and persist its token: ${JSON.stringify(uiEnrollment)}`);
+}
+const firstEnrollment = {
+  body: {
+    device: { id: uiEnrollment.token.device_id, name: uiEnrollment.request.name },
+    token: uiEnrollment.token.token,
+  },
+};
+const storedUiDevice = sqliteQuery('SELECT id, name, hex(token_digest) FROM receiving_devices WHERE id = ?', [firstEnrollment.body.device.id]);
+const expectedUiDeviceTokenDigest = createHash('sha256').update(firstEnrollment.body.token).digest('hex').toUpperCase();
+if (storedUiDevice.length !== 1 || storedUiDevice[0][1] !== 'My browser'
+  || storedUiDevice[0][2] !== expectedUiDeviceTokenDigest
+  || persistentFilesContain(firstEnrollment.body.token)
+  || serviceOutput.join('').includes(firstEnrollment.body.token)) {
+  throw new Error('the form enrollment did not store the named device and token digest safely');
+}
+
 async function completeAdminOperation(operation) {
   const assertion = await browserAssertion(operation);
   return finishAt('/api/admin/finish', {
     request_id: assertion.requestId,
     credential: assertion.credential,
   });
-}
-const firstEnrollment = await completeAdminOperation({ kind: 'enroll_device', name: 'QA browser', subscription: testSubscription });
-if (firstEnrollment.status !== 200 || firstEnrollment.body.kind !== 'device_enrolled') {
-  throw new Error(`device enrollment failed: ${JSON.stringify(firstEnrollment)}`);
 }
 const secondEnrollment = await completeAdminOperation({ kind: 'enroll_device', name: 'QA browser renamed', subscription: testSubscription });
 if (secondEnrollment.status !== 200
@@ -382,7 +451,6 @@ const payloadValidation = await evaluate(`(async () => {
 if (!payloadValidation.valid || payloadValidation.oldVersion || payloadValidation.expired || payloadValidation.unsafeExtra) {
   throw new Error(`service-worker payload validation failed: ${JSON.stringify(payloadValidation)}`);
 }
-await cdp('Browser.grantPermissions', { origin, permissions: ['notifications'] });
 await cdp('ServiceWorker.enable');
 await evaluate(`navigator.serviceWorker.register('/sw.js', { type: 'module' }).then(() => navigator.serviceWorker.ready)`);
 for (let attempt = 0; attempt < 100 && !serviceWorkerRegistrationId; attempt += 1) await sleep(50);
@@ -867,6 +935,10 @@ console.log(JSON.stringify({
   sendKeyListMetadataOnly: !firstSendKeyListed.text.includes(firstSendKey.secret),
   revokedSendKey: revokedKeySend.status,
   independentSendKey: secondKeyNoDevices.body.outcome,
+  deviceEnrollmentFormName: uiEnrollment.request.name,
+  deviceEnrollmentTokenPersisted: uiEnrollment.token.device_id === firstEnrollment.body.device.id,
+  manifestStandalone: manifestData.display,
+  manifestIconCount: manifestData.icons.length,
   deviceEnrollmentUpsert: firstEnrollment.body.device.id === secondEnrollment.body.device.id,
   deviceTokenRotated: firstEnrollment.body.token !== secondEnrollment.body.token,
   deviceTokenDigestStored: storedDeviceTokenDigest.length === 1 && storedDeviceTokenDigest[0][0] === expectedDeviceTokenDigest,

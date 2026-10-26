@@ -18,7 +18,7 @@ use serde::Serialize;
 
 static WEB_ASSETS: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../../web");
 
-const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; base-uri 'none'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; img-src 'self'; script-src 'self'; style-src 'self'";
+const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; base-uri 'none'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; manifest-src 'self'; img-src 'self'; script-src 'self'; style-src 'self'";
 const MAX_JSON_BODY_BYTES: usize = 16 * 1024;
 
 #[derive(Clone)]
@@ -337,6 +337,7 @@ mod tests {
             response.headers()["content-security-policy"],
             CONTENT_SECURITY_POLICY
         );
+        assert!(CONTENT_SECURITY_POLICY.contains("manifest-src 'self'"));
 
         let response = app
             .oneshot(

@@ -273,6 +273,7 @@ function updateNotificationSupport() {
 }
 
 async function enableNotifications() {
+  const name = String(new FormData(deviceForm).get("name") || "").trim();
   if (isIosDevice() && !isHomeScreenApp()) {
     deviceStatus.textContent = "Add Chime to the Home Screen, open it there, then choose Enable notifications again.";
     return;
@@ -298,7 +299,6 @@ async function enableNotifications() {
     const applicationServerKey = decodeBase64url(publicKey);
     const subscription = await registration.pushManager.getSubscription()
       || await registration.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey });
-    const name = String(new FormData(deviceForm).get("name") || "").trim();
     const completed = await runAdmin({
       kind: "enroll_device",
       name,
