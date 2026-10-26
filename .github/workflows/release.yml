@@ -39,6 +39,20 @@ jobs:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
 
+      - name: Check out the repository for release PR synchronization
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Synchronize the release PR Cargo.lock
+        env:
+          RELEASE_PLEASE_PR: ${{ steps.release_please.outputs.pr }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 scripts/sync-release-pr-lockfile.py
+
       - name: Export release outputs
         id: release
         env:

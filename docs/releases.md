@@ -14,7 +14,7 @@ No PAT or GitHub App token is needed. The release workflow uses `GITHUB_TOKEN`. 
 
 ## Review and operate a release
 
-Release Please runs on pushes to `main`. It opens or updates one release pull request. Review its changelog and confirm that the workspace manifest, lockfile, Release Please manifest, and `release-version.txt` all use the same version. Merge that pull request to create the draft release and tag.
+Release Please runs on pushes to `main`. It opens or updates one release pull request. The workflow checks out that open PR's exact head and runs `cargo update --workspace`. It commits `Cargo.lock` only when the three workspace package versions need synchronization. An unexpected lockfile dependency change or a concurrent push stops the workflow. Review the final PR head and confirm that the workspace manifest, lockfile, Release Please manifest, and `release-version.txt` all use the same version. Approve its required checks if GitHub requires manual approval, then merge the PR to create the draft release and tag.
 
 The same workflow run checks out the tag, builds the Linux AMD64 image and Linux x86-64 GNU CLI, attaches the CLI archive and checksum, records the image digest, creates and verifies Artifact Attestations, tests the CLI in a clean Debian runtime, and anonymously pulls and starts the image. It publishes the GitHub release only after these checks pass. It does not rely on a second workflow triggered by the token-created release.
 
