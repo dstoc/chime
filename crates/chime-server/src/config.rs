@@ -30,8 +30,6 @@ impl Origin {
         &self.serialized
     }
 
-    // Used when the WebAuthn ceremony manager is added in the next milestone.
-    #[allow(dead_code)]
     pub fn rp_id(&self) -> &str {
         &self.rp_id
     }

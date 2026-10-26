@@ -1,18 +1,29 @@
 use crate::{data_dir, vapid::VapidIdentity};
 use anyhow::{Context, Result, bail};
-use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior, params};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use rusqlite::{
+    Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
+};
+use sha2::{Digest, Sha256};
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
 };
+use subtle::ConstantTimeEq;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use webauthn_rs::prelude::{AuthenticationResult, Passkey};
 
 const DATABASE_FILE: &str = "chime.sqlite3";
 const DATABASE_CONCURRENCY: usize = 4;
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
+const SETUP_CODE_LIFETIME_SECONDS: i64 = 15 * 60;
+const MAX_ADMIN_PASSKEYS: usize = 16;
 
 pub struct Store {
     database: Database,
+    // Loaded and checked here; later milestones consume the persistent identity for push delivery.
+    #[allow(dead_code)]
     vapid: VapidIdentity,
 }
 
@@ -45,13 +56,356 @@ impl Store {
         })
     }
 
+    #[allow(dead_code)]
     pub fn database(&self) -> &Database {
         &self.database
     }
 
+    #[allow(dead_code)]
     pub fn vapid(&self) -> &VapidIdentity {
         &self.vapid
     }
+
+    /// Create and persist the first-use setup code once, returning it only to the foreground startup.
+    pub async fn initialize_setup_code(&self) -> Result<Option<String>> {
+        let needs_code = self
+            .database
+            .run(|connection| {
+                connection.query_row(
+                    "SELECT initialized = 0 AND setup_digest IS NULL AND setup_consumed = 0
+                     FROM admin_bootstrap WHERE singleton = 1",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )
+            })
+            .await?;
+        if !needs_code {
+            return Ok(None);
+        }
+        let code = generate_setup_code()?;
+        let digest = Sha256::digest(code.as_bytes()).to_vec();
+        let expires_at = unix_now()? + SETUP_CODE_LIFETIME_SECONDS;
+        self.database
+            .run(move |connection| {
+                let changed = connection.execute(
+                    "UPDATE admin_bootstrap
+                     SET setup_digest = ?1, setup_expires_at = ?2
+                     WHERE singleton = 1 AND initialized = 0
+                       AND setup_digest IS NULL AND setup_consumed = 0",
+                    params![digest, expires_at],
+                )?;
+                Ok((changed == 1).then_some(code))
+            })
+            .await
+    }
+
+    pub async fn setup_status(&self) -> Result<SetupStatus> {
+        self.database
+            .run(|connection| {
+                connection.query_row(
+                    "SELECT initialized, setup_digest IS NOT NULL AND setup_consumed = 0
+                         AND setup_expires_at > unixepoch()
+                     FROM admin_bootstrap WHERE singleton = 1",
+                    [],
+                    |row| {
+                        Ok(SetupStatus {
+                            initialized: row.get::<_, i64>(0)? != 0,
+                            available: row.get::<_, i64>(1)? != 0,
+                        })
+                    },
+                )
+            })
+            .await
+    }
+
+    pub async fn consume_setup_code(&self, code: String) -> Result<Option<u64>> {
+        let code_digest = Sha256::digest(code.as_bytes()).to_vec();
+        let now = unix_now()?;
+        self.database
+            .run(move |connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let (initialized, consumed, expires_at, stored_digest): (
+                    i64,
+                    i64,
+                    Option<i64>,
+                    Option<Vec<u8>>,
+                ) = transaction.query_row(
+                    "SELECT initialized, setup_consumed, setup_expires_at, setup_digest
+                     FROM admin_bootstrap WHERE singleton = 1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )?;
+                let valid = initialized == 0
+                    && consumed == 0
+                    && expires_at.is_some_and(|expiry| expiry > now)
+                    && stored_digest
+                        .as_deref()
+                        .is_some_and(|stored| bool::from(stored.ct_eq(&code_digest)));
+                if valid {
+                    transaction.execute(
+                        "UPDATE admin_bootstrap SET setup_consumed = 1
+                         WHERE singleton = 1 AND initialized = 0 AND setup_consumed = 0",
+                        [],
+                    )?;
+                }
+                transaction.commit()?;
+                Ok(if valid {
+                    expires_at.map(|expiry| (expiry - now) as u64)
+                } else {
+                    None
+                })
+            })
+            .await
+    }
+
+    pub async fn passkeys(&self) -> Result<Vec<AdminPasskey>> {
+        self.database
+            .run(|connection| read_passkeys(connection))
+            .await
+    }
+
+    pub async fn complete_admin_operation(
+        &self,
+        result: AuthenticationResult,
+        operation: AuthenticatedOperation,
+    ) -> Result<AdminCompletion> {
+        self.database
+            .run(move |connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let credential_id = result.cred_id().as_ref().to_vec();
+                let current_json: Option<String> = transaction
+                    .query_row(
+                        "SELECT passkey_json FROM admin_passkeys WHERE credential_id = ?1",
+                        params![credential_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                let Some(current_json) = current_json else {
+                    return Err(store_error("authorizing passkey is no longer registered"));
+                };
+                let mut passkey: Passkey =
+                    serde_json::from_str(&current_json).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?;
+                let changed = passkey.update_credential(&result).unwrap_or(false);
+                if changed {
+                    let encoded = serde_json::to_string(&passkey).map_err(|error| {
+                        rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+                    })?;
+                    transaction.execute(
+                        "UPDATE admin_passkeys SET passkey_json = ?1 WHERE credential_id = ?2",
+                        params![encoded, credential_id],
+                    )?;
+                }
+
+                let completion = match operation {
+                    AuthenticatedOperation::List => {
+                        AdminCompletion::Listed(read_passkeys(&transaction)?)
+                    }
+                    AuthenticatedOperation::Remove(credential_id) => {
+                        let count: i64 = transaction.query_row(
+                            "SELECT COUNT(*) FROM admin_passkeys",
+                            [],
+                            |row| row.get(0),
+                        )?;
+                        if count <= 1 {
+                            AdminCompletion::Rejected(AdminRejection::LastPasskey)
+                        } else {
+                            let removed = transaction.execute(
+                                "DELETE FROM admin_passkeys WHERE credential_id = ?1",
+                                params![credential_id],
+                            )?;
+                            if removed != 1 {
+                                AdminCompletion::Rejected(AdminRejection::PasskeyNotFound)
+                            } else {
+                                AdminCompletion::Listed(read_passkeys(&transaction)?)
+                            }
+                        }
+                    }
+                    AuthenticatedOperation::Add(name) => {
+                        let count: i64 = transaction.query_row(
+                            "SELECT COUNT(*) FROM admin_passkeys",
+                            [],
+                            |row| row.get(0),
+                        )?;
+                        if count >= MAX_ADMIN_PASSKEYS as i64 {
+                            AdminCompletion::Rejected(AdminRejection::PasskeyLimit)
+                        } else {
+                            AdminCompletion::AddAuthorized {
+                                name,
+                                authorizer_id: result.cred_id().as_ref().to_vec(),
+                                exclude_credentials: read_passkeys(&transaction)?
+                                    .into_iter()
+                                    .map(|entry| entry.passkey.cred_id().clone())
+                                    .collect(),
+                            }
+                        }
+                    }
+                };
+                transaction.commit()?;
+                Ok(completion)
+            })
+            .await
+    }
+
+    pub async fn register_first_passkey(&self, passkey: Passkey, name: String) -> Result<()> {
+        let now = unix_now()?;
+        self.database
+            .run(move |connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let (initialized, consumed, expires_at): (i64, i64, Option<i64>) = transaction
+                    .query_row(
+                        "SELECT initialized, setup_consumed, setup_expires_at
+                     FROM admin_bootstrap WHERE singleton = 1",
+                        [],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )?;
+                if initialized != 0
+                    || consumed == 0
+                    || expires_at.is_none_or(|expiry| expiry <= now)
+                {
+                    return Err(store_error("first-use setup is no longer available"));
+                }
+                insert_passkey(&transaction, &passkey, &name)?;
+                transaction.execute(
+                    "UPDATE admin_bootstrap SET initialized = 1, setup_digest = NULL,
+                         setup_expires_at = NULL, setup_consumed = 1
+                     WHERE singleton = 1 AND initialized = 0 AND setup_consumed = 1",
+                    [],
+                )?;
+                transaction.commit()?;
+                Ok(())
+            })
+            .await
+    }
+
+    pub async fn register_authorized_passkey(
+        &self,
+        passkey: Passkey,
+        name: String,
+        authorizer_id: Vec<u8>,
+    ) -> Result<PasskeyRegistrationResult> {
+        self.database
+            .run(move |connection| {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let initialized: i64 = transaction.query_row(
+                    "SELECT initialized FROM admin_bootstrap WHERE singleton = 1",
+                    [],
+                    |row| row.get(0),
+                )?;
+                let authorizer_exists: bool = transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM admin_passkeys WHERE credential_id = ?1)",
+                    params![authorizer_id],
+                    |row| row.get(0),
+                )?;
+                if initialized == 0 || !authorizer_exists {
+                    transaction.commit()?;
+                    return Ok(PasskeyRegistrationResult::AuthorizerRemoved);
+                }
+                let duplicate: bool = transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM admin_passkeys WHERE credential_id = ?1)",
+                    params![passkey.cred_id().as_ref()],
+                    |row| row.get(0),
+                )?;
+                if duplicate {
+                    transaction.commit()?;
+                    return Ok(PasskeyRegistrationResult::Duplicate);
+                }
+                let count: i64 =
+                    transaction
+                        .query_row("SELECT COUNT(*) FROM admin_passkeys", [], |row| row.get(0))?;
+                if count >= MAX_ADMIN_PASSKEYS as i64 {
+                    transaction.commit()?;
+                    return Ok(PasskeyRegistrationResult::Limit);
+                }
+                insert_passkey(&transaction, &passkey, &name)?;
+                transaction.commit()?;
+                Ok(PasskeyRegistrationResult::Added)
+            })
+            .await
+    }
+
+    /// Replace administrator credentials while the caller holds the exclusive data-directory lock.
+    pub fn reset_admin(path: &Path) -> Result<String> {
+        let directory = data_dir::prepare_private_directory(path)?;
+        let _lock = data_dir::DataDirLock::acquire(&directory)?;
+        let database_path = directory.join(DATABASE_FILE);
+        data_dir::reject_symlink_or_non_file(&database_path)?;
+        if !database_path.exists() {
+            bail!("no Chime database exists in {}", directory.display());
+        }
+        let mut connection = Connection::open_with_flags(
+            &database_path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_FULL_MUTEX,
+        )
+        .with_context(|| format!("open SQLite database {}", database_path.display()))?;
+        configure_connection(&connection)?;
+        initialize_schema(&mut connection)?;
+
+        let code = generate_setup_code()?;
+        let digest = Sha256::digest(code.as_bytes()).to_vec();
+        let expires_at = unix_now()? + SETUP_CODE_LIFETIME_SECONDS;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute("DELETE FROM admin_passkeys", [])?;
+        transaction.execute(
+            "UPDATE admin_bootstrap SET initialized = 0, setup_digest = ?1,
+                 setup_expires_at = ?2, setup_consumed = 0 WHERE singleton = 1",
+            params![digest, expires_at],
+        )?;
+        transaction.commit()?;
+        Ok(code)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SetupStatus {
+    pub initialized: bool,
+    pub available: bool,
+}
+
+#[derive(Clone)]
+pub struct AdminPasskey {
+    pub id: String,
+    pub name: String,
+    pub created_at: i64,
+    pub passkey: Passkey,
+}
+
+pub enum AuthenticatedOperation {
+    List,
+    Add(String),
+    Remove(Vec<u8>),
+}
+
+pub enum AdminCompletion {
+    Listed(Vec<AdminPasskey>),
+    Rejected(AdminRejection),
+    AddAuthorized {
+        name: String,
+        authorizer_id: Vec<u8>,
+        exclude_credentials: Vec<webauthn_rs::prelude::CredentialID>,
+    },
+}
+
+pub enum AdminRejection {
+    LastPasskey,
+    PasskeyNotFound,
+    PasskeyLimit,
+}
+
+pub enum PasskeyRegistrationResult {
+    Added,
+    Duplicate,
+    AuthorizerRemoved,
+    Limit,
 }
 
 #[derive(Clone)]
@@ -132,6 +486,7 @@ fn initialize_schema(connection: &mut Connection) -> Result<()> {
                 let vapid = VapidIdentity::generate()?;
                 apply_migration_one(&transaction, &vapid)?;
             }
+            1 => apply_migration_two(&transaction)?,
             version => bail!("no database migration is available after version {version}"),
         }
         transaction.commit()?;
@@ -139,6 +494,96 @@ fn initialize_schema(connection: &mut Connection) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn apply_migration_two(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        "CREATE TABLE admin_bootstrap (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            initialized INTEGER NOT NULL CHECK (initialized IN (0, 1)),
+            setup_digest BLOB CHECK (setup_digest IS NULL OR length(setup_digest) = 32),
+            setup_expires_at INTEGER,
+            setup_consumed INTEGER NOT NULL CHECK (setup_consumed IN (0, 1)),
+            CHECK ((setup_digest IS NULL) = (setup_expires_at IS NULL))
+        );
+        INSERT INTO admin_bootstrap
+            (singleton, initialized, setup_digest, setup_expires_at, setup_consumed)
+            VALUES (1, 0, NULL, NULL, 0);
+        CREATE TABLE admin_passkeys (
+            credential_id BLOB PRIMARY KEY CHECK (length(credential_id) BETWEEN 1 AND 1024),
+            name TEXT NOT NULL CHECK (length(name) BETWEEN 1 AND 100),
+            passkey_json TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        );
+        INSERT INTO schema_migrations (version, applied_at) VALUES (2, unixepoch());",
+    )?;
+    Ok(())
+}
+
+fn read_passkeys(connection: &Connection) -> rusqlite::Result<Vec<AdminPasskey>> {
+    let mut statement = connection.prepare(
+        "SELECT credential_id, name, passkey_json, created_at
+         FROM admin_passkeys ORDER BY created_at, credential_id",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, Vec<u8>>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, i64>(3)?,
+        ))
+    })?;
+
+    rows.map(|row| {
+        let (credential_id, name, passkey_json, created_at) = row?;
+        let passkey: Passkey = serde_json::from_str(&passkey_json).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                2,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?;
+        Ok(AdminPasskey {
+            id: URL_SAFE_NO_PAD.encode(credential_id),
+            name,
+            created_at,
+            passkey,
+        })
+    })
+    .collect()
+}
+
+fn insert_passkey(
+    transaction: &Transaction<'_>,
+    passkey: &Passkey,
+    name: &str,
+) -> rusqlite::Result<()> {
+    let credential_id = passkey.cred_id().as_ref();
+    let passkey_json = serde_json::to_string(passkey)
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    transaction.execute(
+        "INSERT INTO admin_passkeys (credential_id, name, passkey_json, created_at)
+         VALUES (?1, ?2, ?3, unixepoch())",
+        params![credential_id, name, passkey_json],
+    )?;
+    Ok(())
+}
+
+fn store_error(message: &str) -> rusqlite::Error {
+    rusqlite::Error::InvalidParameterName(message.to_owned())
+}
+
+fn generate_setup_code() -> Result<String> {
+    let mut secret = [0_u8; 32];
+    getrandom::fill(&mut secret).context("generate first-use setup code")?;
+    Ok(URL_SAFE_NO_PAD.encode(secret))
+}
+
+fn unix_now() -> Result<i64> {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?;
+    i64::try_from(elapsed.as_secs()).context("system clock value is out of range")
 }
 
 fn apply_migration_one(transaction: &Transaction<'_>, vapid: &VapidIdentity) -> Result<()> {
@@ -293,7 +738,171 @@ mod tests {
                 })
             })
             .await?;
-        assert_eq!(version, 1);
+        assert_eq!(version, 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn setup_code_is_hashed_disclosed_once_and_consumed_once() -> Result<()> {
+        use sha2::{Digest, Sha256};
+
+        let root = tempfile::tempdir()?;
+        let path = root.path().join("state");
+        let store = Store::open(&path)?;
+        let code = store
+            .initialize_setup_code()
+            .await?
+            .context("first startup should create the setup code")?;
+        assert!(store.initialize_setup_code().await?.is_none());
+
+        let stored_digest = store
+            .database()
+            .run(|connection| {
+                connection.query_row(
+                    "SELECT setup_digest FROM admin_bootstrap WHERE singleton = 1",
+                    [],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )
+            })
+            .await?;
+        assert_eq!(stored_digest, Sha256::digest(code.as_bytes()).to_vec());
+        assert_ne!(stored_digest, code.as_bytes());
+
+        assert!(
+            store
+                .consume_setup_code("incorrect".to_owned())
+                .await?
+                .is_none()
+        );
+        assert!(store.consume_setup_code(code.clone()).await?.is_some());
+        assert!(store.consume_setup_code(code).await?.is_none());
+        assert!(!store.setup_status().await?.available);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn setup_code_expires_and_concurrent_replays_only_consume_once() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let path = root.path().join("state");
+        let store = Arc::new(Store::open(&path)?);
+        let code = store
+            .initialize_setup_code()
+            .await?
+            .context("first startup should create the setup code")?;
+
+        let first_store = Arc::clone(&store);
+        let first_code = code.clone();
+        let first = tokio::spawn(async move { first_store.consume_setup_code(first_code).await });
+        let second_store = Arc::clone(&store);
+        let second = tokio::spawn(async move { second_store.consume_setup_code(code).await });
+        let first = first.await??;
+        let second = second.await??;
+        assert_eq!(
+            usize::from(first.is_some()) + usize::from(second.is_some()),
+            1
+        );
+
+        let expired = Store::open(&root.path().join("expired"))?;
+        let expired_code = expired
+            .initialize_setup_code()
+            .await?
+            .context("first startup should create the setup code")?;
+        expired
+            .database()
+            .run(|connection| {
+                connection.execute(
+                    "UPDATE admin_bootstrap SET setup_expires_at = unixepoch() - 1 WHERE singleton = 1",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await?;
+        assert!(expired.consume_setup_code(expired_code).await?.is_none());
+        assert!(!expired.setup_status().await?.available);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn initialized_restart_does_not_create_a_new_setup_code() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let path = root.path().join("state");
+        let store = Store::open(&path)?;
+        store.initialize_setup_code().await?;
+        store
+            .database()
+            .run(|connection| {
+                connection.execute(
+                    "UPDATE admin_bootstrap SET initialized = 1, setup_digest = NULL,
+                         setup_expires_at = NULL, setup_consumed = 1 WHERE singleton = 1",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await?;
+        drop(store);
+
+        let restarted = Store::open(&path)?;
+        assert!(restarted.initialize_setup_code().await?.is_none());
+        assert!(restarted.setup_status().await?.initialized);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reset_requires_exclusive_lock_and_preserves_non_admin_state() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let path = root.path().join("state");
+        let store = Store::open(&path)?;
+        store.initialize_setup_code().await?;
+        let original_vapid_private = store.vapid().private_key_bytes().to_vec();
+        let original_vapid_public = store.vapid().public_key_bytes().to_vec();
+        store
+            .database()
+            .run(|connection| {
+                connection.execute_batch(
+                    "CREATE TABLE send_keys (id INTEGER PRIMARY KEY, value TEXT);
+                     CREATE TABLE subscriptions (id INTEGER PRIMARY KEY, value TEXT);",
+                )?;
+                connection.execute("INSERT INTO send_keys (id, value) VALUES (1, 'keep')", [])?;
+                connection.execute(
+                    "INSERT INTO subscriptions (id, value) VALUES (1, 'keep')",
+                    [],
+                )?;
+                connection.execute(
+                    "INSERT INTO admin_passkeys (credential_id, name, passkey_json, created_at)
+                     VALUES (x'01', 'test', '{}', unixepoch())",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await?;
+        let locked = Store::reset_admin(&path).expect_err("reset must refuse a live Store lock");
+        assert!(locked.to_string().contains("already in use"));
+        drop(store);
+
+        let new_code = Store::reset_admin(&path)?;
+        let restarted = Store::open(&path)?;
+        assert!(restarted.setup_status().await?.available);
+        assert!(restarted.consume_setup_code(new_code).await?.is_some());
+        assert_eq!(
+            restarted.vapid().private_key_bytes(),
+            original_vapid_private
+        );
+        assert_eq!(restarted.vapid().public_key_bytes(), original_vapid_public);
+        let preserved = restarted
+            .database()
+            .run(|connection| {
+                let keys: i64 =
+                    connection.query_row("SELECT COUNT(*) FROM send_keys", [], |row| row.get(0))?;
+                let subscriptions: i64 =
+                    connection
+                        .query_row("SELECT COUNT(*) FROM subscriptions", [], |row| row.get(0))?;
+                let passkeys: i64 =
+                    connection
+                        .query_row("SELECT COUNT(*) FROM admin_passkeys", [], |row| row.get(0))?;
+                Ok((keys, subscriptions, passkeys))
+            })
+            .await?;
+        assert_eq!(preserved, (1, 1, 0));
         Ok(())
     }
 
