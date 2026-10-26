@@ -586,8 +586,15 @@ jobs:
           PY
           release_json=$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID")
           jq -e --arg tag "$TAG" '.tag_name == $tag and .draft == true' <<< "$release_json" >/dev/null
-          gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
-            --raw-field "body=$(cat "$RUNNER_TEMP/release-notes.md")" >/dev/null
+          updated_release=$(gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
+            --raw-field "tag_name=$TAG" \
+            --raw-field "body=$(cat "$RUNNER_TEMP/release-notes.md")")
+          jq -e --arg tag "$TAG" '
+            .tag_name == $tag and .draft == true and .published_at == null
+          ' <<< "$updated_release" >/dev/null || {
+            echo "Updating release notes changed the draft tag; refusing to publish" >&2
+            exit 1
+          }
 
       - name: Publish the complete verified release
         env:
@@ -611,5 +618,12 @@ jobs:
             printf -- '- CLI SHA-256: `%s`\n' "$cli_sha"
             printf '%s\n' '- The GHCR image was pulled without registry credentials and its server UI responded in the Linux AMD64 runner.'
           } >> "$GITHUB_STEP_SUMMARY"
-          gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
-            --field draft=false >/dev/null
+          published_release=$(gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
+            --raw-field "tag_name=$TAG" \
+            --field draft=false)
+          jq -e --arg tag "$TAG" '
+            .tag_name == $tag and .draft == false and .published_at != null
+          ' <<< "$published_release" >/dev/null || {
+            echo "GitHub did not publish the release with the expected tag" >&2
+            exit 1
+          }
