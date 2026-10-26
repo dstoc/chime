@@ -255,26 +255,32 @@ Keep the pre-restore directories until both services work. Restore Tailscale sta
 
 This transition keeps the existing Chime data, Tailscale identity, Serve configuration, and Podman secret. It removes the old pod and container objects only. The persistent state directories are bind mounts and remain on disk.
 
-1. Back up the Chime and Tailscale directories as described above. Note whether you removed the bootstrap `Secret=` and `Environment=TS_AUTHKEY=...` lines after enrollment. Record your configured origin and checkout paths.
-2. Stop the old pod service before replacing any unit files:
+1. Stop the old pod service before taking the migration backup. Keep the pod and both containers stopped until the migration is complete. Do not use the backup procedure above during this transition; it starts Tailscale again after archiving.
 
    ```sh
    systemctl --user stop chime-pod.service
+   umask 077
+   podman unshare tar --numeric-owner --xattrs -C "$HOME/.local/share/chime" \
+     -czf "$HOME/chime-data-backup.tar.gz" data
+   podman unshare tar --numeric-owner --xattrs -C "$HOME/.local/share/chime" \
+     -czf "$HOME/chime-tailscale-backup.tar.gz" tailscale
    ```
 
-3. Remove the stopped pod and its containers. This frees the existing `chime-server` and `chime-tailscale` container names; it does not remove the bind-mounted state directories or the Podman secret:
+   Note whether you removed the bootstrap `Secret=` and `Environment=TS_AUTHKEY=...` lines after enrollment. Record your configured origin and checkout paths.
+
+2. Remove the old pod and its containers. Stopping the Quadlet pod service may already remove the pod, so `--ignore` allows this cleanup to continue in either case. This frees the existing `chime-server` and `chime-tailscale` container names; it does not remove the bind-mounted state directories or the Podman secret:
 
    ```sh
-   podman pod rm --force chime
+   podman pod rm --ignore --force chime
    ```
 
-4. Install the updated `chime.container` and `chime-tailscale.container` from the checkout. Keep the installed `chime.build` and Serve configuration. Reapply your checkout paths and configured HTTPS origin. If you already removed the bootstrap secret lines after enrollment, keep them absent; do not restore secret injection during this migration.
+3. Install the updated `chime.container` and `chime-tailscale.container` from the checkout. Keep the installed `chime.build` and Serve configuration. Reapply your checkout paths and configured HTTPS origin. If you already removed the bootstrap secret lines after enrollment, keep them absent; do not restore secret injection during this migration.
 
    ```sh
    install -m 0600 examples/quadlet/chime.container "$HOME/.config/containers/systemd/chime.container"
    install -m 0600 examples/quadlet/chime-tailscale.container "$HOME/.config/containers/systemd/chime-tailscale.container"
    ```
-5. Remove the old pod Quadlet file, reload systemd, and start the two-container deployment:
+4. Remove the old pod Quadlet file, reload systemd, and start the two-container deployment:
 
    ```sh
    rm "$HOME/.config/containers/systemd/chime.pod"
@@ -284,7 +290,7 @@ This transition keeps the existing Chime data, Tailscale identity, Serve configu
    systemctl --user status chime-tailscale.service chime.service
    ```
 
-6. Confirm the existing Tailscale identity is online, Serve forwards to Chime, the browser URL matches the configured origin, and both containers share the same network namespace. Do not delete the pre-migration state directories or archives until these checks pass.
+5. Confirm the existing Tailscale identity is online, Serve forwards to Chime, the browser URL matches the configured origin, and both containers share the same network namespace. Do not delete the pre-migration state directories or archives until these checks pass.
 
 ## Diagnose startup and authentication failures
 
