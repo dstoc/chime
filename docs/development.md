@@ -20,6 +20,6 @@ cargo build -p chime-server --locked
 node tests/browser/passkeys.mjs
 ```
 
-The script checks invalid and valid setup codes, registration and authentication with required user verification, passkey list/add/remove flows, cancellation, last-passkey protection, wrong challenge/origin/RP ID/user-verification assertions, assertion replay, and the absence of cookies or browser storage. It keeps the generated setup code in memory and removes its temporary data when it exits. Set `CHROMIUM_PATH` if Chromium is not at `/usr/bin/chromium`.
+The script checks invalid and valid setup codes, registration and authentication with required user verification, passkey list/add/remove flows, cancellation, last-passkey protection, wrong challenge/origin/RP ID/user-verification assertions, and the absence of cookies or browser storage. It also submits valid assertion and registration completions after expiry, removes authorizers before both completion stages, and races duplicate valid mutation completions while checking the stored passkey list. Expiry coverage waits just over two minutes. The script keeps the generated setup code in memory and removes its temporary data when it exits. Set `CHROMIUM_PATH` if Chromium is not at `/usr/bin/chromium`.
 
 This check uses a virtual authenticator and a temporary self-signed certificate. It does not verify physical passkeys, production TLS, tailnet access, push-provider delivery, or another browser's behavior. Those checks still require manual acceptance on the target devices and deployment.

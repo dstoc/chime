@@ -268,21 +268,262 @@ const cancelAdd = await evaluate(`(async () => {
   return result;
 })()`);
 if (!cancelAdd.message.includes('cancelled') || cancelAdd.name !== 'Cancelled key' || cancelAdd.count !== 2) throw new Error(`cancel flow failed: ${JSON.stringify(cancelAdd)}`);
-const removeOne = await evaluate(`(async () => {
-  document.querySelector('#passkey-list button').click();
-  await new Promise(resolve => setTimeout(resolve, 1000));
+const initialCredentialStates = (await cdp('WebAuthn.getCredentials', { authenticatorId })).credentials;
+const initialCredentialId = originalCredentialState.credentials[0].credentialId;
+const stateA = initialCredentialStates.find((credential) => credential.credentialId === initialCredentialId);
+const stateB = initialCredentialStates.find((credential) => credential.credentialId !== initialCredentialId);
+if (!stateA || !stateB) throw new Error('expected the primary and secondary virtual passkeys');
+
+function credentialId(state) { return Buffer.from(state.credentialId, 'base64').toString('base64url'); }
+function credentialIdSet(states) { return new Set(states.map((state) => state.credentialId)); }
+async function currentCredentialStates() {
+  return (await cdp('WebAuthn.getCredentials', { authenticatorId })).credentials;
+}
+async function useFreshAuthenticator() {
+  await cdp('WebAuthn.removeVirtualAuthenticator', { authenticatorId });
+  const added = await cdp('WebAuthn.addVirtualAuthenticator', {
+    options: {
+      protocol: 'ctap2',
+      transport: 'internal',
+      hasResidentKey: true,
+      hasUserVerification: true,
+      isUserVerified: true,
+      automaticPresenceSimulation: true,
+    },
+  });
+  authenticatorId = added.authenticatorId;
+}
+async function restoreCredentials(states) {
+  const currentIds = credentialIdSet(await currentCredentialStates());
+  for (const state of states) {
+    if (!currentIds.has(state.credentialId)) {
+      await cdp('WebAuthn.addCredential', { authenticatorId, credential: state });
+    }
+  }
+}
+async function addVirtualPasskey(name) {
+  const before = await currentCredentialStates();
+  const authorization = await browserAssertion({ kind: 'add_passkey', name });
+  const authorized = await finishAt('/api/admin/finish', {
+    request_id: authorization.requestId,
+    credential: authorization.credential,
+  });
+  if (authorized.status !== 200 || authorized.body.kind !== 'add_registration') {
+    throw new Error(`add authorization failed for ${name}: ${JSON.stringify(authorized)}`);
+  }
+  const credentialsAfterAuthorization = await currentCredentialStates();
+  await useFreshAuthenticator();
+  const credential = await browserRegistration(authorized.body.options);
+  const completed = await finishAt('/api/admin/add/finish', {
+    request_id: authorized.body.request_id,
+    credential,
+  });
+  if (completed.status !== 200) throw new Error(`registration failed for ${name}: ${JSON.stringify(completed)}`);
+  const beforeIds = credentialIdSet(before);
+  const added = (await currentCredentialStates()).find((state) => !beforeIds.has(state.credentialId));
+  if (!added) throw new Error(`virtual authenticator did not create ${name}`);
+  await restoreCredentials(credentialsAfterAuthorization);
+  return added;
+}
+async function withOnlyCredential(credential, action) {
+  const saved = await currentCredentialStates();
+  for (const state of saved) {
+    if (state.credentialId !== credential.credentialId) {
+      await cdp('WebAuthn.removeCredential', {
+        authenticatorId,
+        credentialId: state.credentialId,
+      });
+    }
+  }
+  try {
+    return await action();
+  } finally {
+    const currentIds = credentialIdSet(await currentCredentialStates());
+    for (const state of saved) {
+      if (!currentIds.has(state.credentialId)) {
+        await cdp('WebAuthn.addCredential', { authenticatorId, credential: state });
+      }
+    }
+  }
+}
+async function listPasskeysWith(credential) {
+  const assertion = await withOnlyCredential(credential, () => browserAssertion());
+  const response = await finishAt('/api/admin/finish', {
+    request_id: assertion.requestId,
+    credential: assertion.credential,
+  });
+  if (response.status !== 200) throw new Error(`passkey list failed: ${JSON.stringify(response)}`);
+  return response.body.passkeys;
+}
+async function concurrentFinish(path, body) {
+  return evaluate(`Promise.all([1, 2].map(() => fetch(${JSON.stringify(path)}, {
+    method:'POST', headers:{'Content-Type':'application/json'}, body:${JSON.stringify(JSON.stringify(body))}
+  }).then(response => response.status)))`);
+}
+
+const stateC = await addVirtualPasskey('QA tertiary');
+const stateD = await addVirtualPasskey('QA concurrent removal target');
+let passkeys = await listPasskeysWith(stateA);
+if (passkeys.length !== 4) throw new Error(`expected four passkeys before mutation races, got ${passkeys.length}`);
+
+const concurrentRemovalAssertion = await withOnlyCredential(stateB, () =>
+  browserAssertion({ kind: 'remove_passkey', id: credentialId(stateD) }));
+const concurrentRemovalBody = {
+  request_id: concurrentRemovalAssertion.requestId,
+  credential: concurrentRemovalAssertion.credential,
+};
+const concurrentRemovalStatuses = await concurrentFinish('/api/admin/finish', concurrentRemovalBody);
+if (concurrentRemovalStatuses.slice().sort().join('/') !== '200/409') {
+  throw new Error(`concurrent assertion completion results were ${concurrentRemovalStatuses}`);
+}
+passkeys = await listPasskeysWith(stateB);
+if (passkeys.length !== 3 || passkeys.some((passkey) => passkey.id === credentialId(stateD))) {
+  throw new Error(`concurrent assertion completion did not remove exactly one passkey: ${JSON.stringify(passkeys)}`);
+}
+
+const addEAuthorization = await withOnlyCredential(stateA, () =>
+  browserAssertion({ kind: 'add_passkey', name: 'QA concurrent registration' }));
+const addEAuthorized = await finishAt('/api/admin/finish', {
+  request_id: addEAuthorization.requestId,
+  credential: addEAuthorization.credential,
+});
+if (addEAuthorized.status !== 200 || addEAuthorized.body.kind !== 'add_registration') {
+  throw new Error(`concurrent registration authorization failed: ${JSON.stringify(addEAuthorized)}`);
+}
+const credentialsBeforeE = await currentCredentialStates();
+await useFreshAuthenticator();
+const credentialE = await browserRegistration(addEAuthorized.body.options);
+const concurrentRegistrationBody = {
+  request_id: addEAuthorized.body.request_id,
+  credential: credentialE,
+};
+const concurrentRegistrationStatuses = await concurrentFinish('/api/admin/add/finish', concurrentRegistrationBody);
+if (concurrentRegistrationStatuses.slice().sort().join('/') !== '200/409') {
+  throw new Error(`concurrent registration completion results were ${concurrentRegistrationStatuses}`);
+}
+await restoreCredentials(credentialsBeforeE);
+const stateE = (await currentCredentialStates()).find((state) =>
+  !credentialIdSet(initialCredentialStates.concat(stateC, stateD)).has(state.credentialId));
+if (!stateE) throw new Error('virtual authenticator did not retain the concurrent registration');
+passkeys = await listPasskeysWith(stateB);
+if (passkeys.length !== 4 || !passkeys.some((passkey) => passkey.name === 'QA concurrent registration')) {
+  throw new Error(`concurrent registration did not add exactly one passkey: ${JSON.stringify(passkeys)}`);
+}
+
+const expiredAssertion = await withOnlyCredential(stateA, () => browserAssertion());
+const expiredAddAuthorization = await withOnlyCredential(stateB, () =>
+  browserAssertion({ kind: 'add_passkey', name: 'QA expired registration' }));
+const expiredAddAuthorized = await finishAt('/api/admin/finish', {
+  request_id: expiredAddAuthorization.requestId,
+  credential: expiredAddAuthorization.credential,
+});
+if (expiredAddAuthorized.status !== 200 || expiredAddAuthorized.body.kind !== 'add_registration') {
+  throw new Error(`expired registration authorization failed: ${JSON.stringify(expiredAddAuthorized)}`);
+}
+const credentialsBeforeExpiry = await currentCredentialStates();
+await useFreshAuthenticator();
+const expiredRegistrationCredential = await browserRegistration(expiredAddAuthorized.body.options);
+await restoreCredentials(credentialsBeforeExpiry);
+await sleep(125_000);
+const expiredAssertionStatus = await finishAt('/api/admin/finish', {
+  request_id: expiredAssertion.requestId,
+  credential: expiredAssertion.credential,
+});
+if (expiredAssertionStatus.status !== 409) {
+  throw new Error(`valid assertion completed after expiry with status ${expiredAssertionStatus.status}`);
+}
+const expiredRegistrationStatus = await finishAt('/api/admin/add/finish', {
+  request_id: expiredAddAuthorized.body.request_id,
+  credential: expiredRegistrationCredential,
+});
+if (expiredRegistrationStatus.status !== 409) {
+  throw new Error(`valid registration completed after expiry with status ${expiredRegistrationStatus.status}`);
+}
+passkeys = await listPasskeysWith(stateB);
+if (passkeys.length !== 4 || passkeys.some((passkey) => passkey.name === 'QA expired registration')) {
+  throw new Error(`expired ceremonies changed the passkey list: ${JSON.stringify(passkeys)}`);
+}
+
+const revokedAssertion = await withOnlyCredential(stateA, () => browserAssertion());
+const removeAAssertion = await withOnlyCredential(stateB, () =>
+  browserAssertion({ kind: 'remove_passkey', id: credentialId(stateA) }));
+const removeAResult = await finishAt('/api/admin/finish', {
+  request_id: removeAAssertion.requestId,
+  credential: removeAAssertion.credential,
+});
+if (removeAResult.status !== 200) throw new Error(`could not remove assertion authorizer: ${JSON.stringify(removeAResult)}`);
+const revokedAssertionResult = await finishAt('/api/admin/finish', {
+  request_id: revokedAssertion.requestId,
+  credential: revokedAssertion.credential,
+});
+if (revokedAssertionResult.status !== 403) {
+  throw new Error(`assertion completed after its credential was removed: ${revokedAssertionResult.status}`);
+}
+passkeys = await listPasskeysWith(stateC);
+if (passkeys.length !== 3 || passkeys.some((passkey) => passkey.id === credentialId(stateA))) {
+  throw new Error(`removed assertion authorizer retained authority: ${JSON.stringify(passkeys)}`);
+}
+
+const addFAuthorization = await withOnlyCredential(stateB, () =>
+  browserAssertion({ kind: 'add_passkey', name: 'QA rejected after authorizer removal' }));
+const addFAuthorized = await finishAt('/api/admin/finish', {
+  request_id: addFAuthorization.requestId,
+  credential: addFAuthorization.credential,
+});
+if (addFAuthorized.status !== 200 || addFAuthorized.body.kind !== 'add_registration') {
+  throw new Error(`second registration authorization failed: ${JSON.stringify(addFAuthorized)}`);
+}
+const credentialsBeforeRevokedRegistration = await currentCredentialStates();
+await useFreshAuthenticator();
+const rejectedRegistrationCredential = await browserRegistration(addFAuthorized.body.options);
+await restoreCredentials(credentialsBeforeRevokedRegistration);
+const removeBAssertion = await withOnlyCredential(stateC, () =>
+  browserAssertion({ kind: 'remove_passkey', id: credentialId(stateB) }));
+const removeBResult = await finishAt('/api/admin/finish', {
+  request_id: removeBAssertion.requestId,
+  credential: removeBAssertion.credential,
+});
+if (removeBResult.status !== 200) throw new Error(`could not remove registration authorizer: ${JSON.stringify(removeBResult)}`);
+const rejectedRegistration = await finishAt('/api/admin/add/finish', {
+  request_id: addFAuthorized.body.request_id,
+  credential: rejectedRegistrationCredential,
+});
+if (rejectedRegistration.status !== 403) {
+  throw new Error(`registration completed after its authorizer was removed: ${rejectedRegistration.status}`);
+}
+passkeys = await listPasskeysWith(stateC);
+if (passkeys.length !== 2 || passkeys.some((passkey) => passkey.name === 'QA rejected after authorizer removal')) {
+  throw new Error(`revoked registration authorizer added a passkey: ${JSON.stringify(passkeys)}`);
+}
+
+const refreshedList = await evaluate(`(async () => {
+  document.querySelector('#list-passkeys').click();
+  await new Promise(resolve => setTimeout(resolve, 900));
   return { message: document.querySelector('#message').textContent, count: document.querySelectorAll('#passkey-list li button').length };
 })()`);
-if (removeOne.count !== 1 || removeOne.message !== 'Passkey removed.') throw new Error(`remove failed: ${JSON.stringify(removeOne)}`);
+if (refreshedList.count !== 2 || refreshedList.message !== 'Passkey list updated.') {
+  throw new Error(`UI did not refresh after security regression checks: ${JSON.stringify(refreshedList)}`);
+}
+const removeUntilOne = await evaluate(`(async () => {
+  let count = document.querySelectorAll('#passkey-list li button').length;
+  while (count > 1) {
+    document.querySelector('#passkey-list button').click();
+    await new Promise(resolve => setTimeout(resolve, 900));
+    count = document.querySelectorAll('#passkey-list li button').length;
+    if (document.querySelector('#message').textContent !== 'Passkey removed.') throw new Error('passkey removal failed');
+  }
+  return { message: document.querySelector('#message').textContent, count };
+})()`);
+if (removeUntilOne.count !== 1) throw new Error(`could not retain a single passkey: ${JSON.stringify(removeUntilOne)}`);
 const lastRemove = await evaluate(`(async () => {
   document.querySelector('#passkey-list button').click();
-  await new Promise(resolve => setTimeout(resolve, 1000));
+  await new Promise(resolve => setTimeout(resolve, 900));
   return { message: document.querySelector('#message').textContent, count: document.querySelectorAll('#passkey-list li button').length };
 })()`);
 if (!lastRemove.message.includes('at least one') || lastRemove.count !== 1) throw new Error(`last-passkey guard failed: ${JSON.stringify(lastRemove)}`);
-async function browserAssertion(mutateChallenge = false) {
+async function browserAssertion(operation = { kind: 'list_passkeys' }, mutateChallenge = false) {
   return evaluate(`(async () => {
-    const start = await fetch('/api/admin/challenge', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({kind:'list_passkeys'}) }).then(r => r.json());
+    const start = await fetch('/api/admin/challenge', { method:'POST', headers:{'Content-Type':'application/json'}, body:${JSON.stringify(JSON.stringify(operation))} }).then(r => r.json());
     const options = structuredClone(start.options.publicKey);
     const decode = value => Uint8Array.from(atob(value.replaceAll('-','+').replaceAll('_','/').padEnd(Math.ceil(value.length/4)*4,'=')), c => c.charCodeAt(0));
     options.challenge = decode(options.challenge);
@@ -292,8 +533,32 @@ async function browserAssertion(mutateChallenge = false) {
     return { requestId:start.request_id, credential:assertion.toJSON(), uv:options.userVerification };
   })()`);
 }
+async function browserRegistration(options) {
+  const result = await evaluate(`(async () => {
+    try {
+      const publicKey = structuredClone(${JSON.stringify(options.publicKey)});
+      const decode = value => Uint8Array.from(atob(value.replaceAll('-','+').replaceAll('_','/').padEnd(Math.ceil(value.length/4)*4,'=')), c => c.charCodeAt(0));
+      publicKey.challenge = decode(publicKey.challenge);
+      if (publicKey.user) publicKey.user.id = decode(publicKey.user.id);
+      for (const item of publicKey.excludeCredentials || []) item.id = decode(item.id);
+      return (await navigator.credentials.create({ publicKey })).toJSON();
+    } catch (error) {
+      return { qaError: String(error.name) + ': ' + String(error.message) };
+    }
+  })()`);
+  if (result.qaError) throw new Error(`browser registration failed: ${result.qaError}`);
+  return result;
+}
+async function finishAt(path, body) {
+  return evaluate(`(async () => {
+    const response = await fetch(${JSON.stringify(path)}, {method:'POST',headers:{'Content-Type':'application/json'},body:${JSON.stringify(JSON.stringify(body))}});
+    let result = null;
+    try { result = await response.json(); } catch {}
+    return { status: response.status, body: result };
+  })()`);
+}
 async function finish(body) {
-  return evaluate(`fetch('/api/admin/finish', {method:'POST',headers:{'Content-Type':'application/json'},body:${JSON.stringify(JSON.stringify(body))}}).then(response => response.status)`);
+  return (await finishAt('/api/admin/finish', body)).status;
 }
 function bytes(value) { return Buffer.from(value, 'base64url'); }
 function b64url(value) { return Buffer.from(value).toString('base64url'); }
@@ -309,7 +574,7 @@ function signedCredential(credential, credentialState, changeAuthData) {
   const signature = sign('sha256', Buffer.concat([authData, clientDataHash]), privateKey);
   return { ...credential, response: { ...response, authenticatorData: b64url(authData), signature: b64url(signature) } };
 }
-const wrongChallengeAssertion = await browserAssertion(true);
+const wrongChallengeAssertion = await browserAssertion({ kind: 'list_passkeys' }, true);
 if (wrongChallengeAssertion.uv !== 'required') throw new Error(`authentication did not require user verification: ${wrongChallengeAssertion.uv}`);
 const wrongChallenge = await finish({
   request_id: wrongChallengeAssertion.requestId,
@@ -390,6 +655,12 @@ console.log(JSON.stringify({
   wrongRpId: wrongRp,
   missingUserVerification: missingUv,
   assertionReplay: replayAgain,
+  expiredAssertionCompletion: expiredAssertionStatus.status,
+  expiredRegistrationCompletion: expiredRegistrationStatus.status,
+  revokedAssertionAuthorizer: revokedAssertionResult.status,
+  revokedRegistrationAuthorizer: rejectedRegistration.status,
+  concurrentAssertionMutation: concurrentRemovalStatuses,
+  concurrentRegistrationMutation: concurrentRegistrationStatuses,
   noCookies,
   mobileLayout,
   desktopLayout,
