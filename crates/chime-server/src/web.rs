@@ -20,7 +20,7 @@ use std::collections::HashSet;
 
 static WEB_ASSETS: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../../web");
 
-const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; base-uri 'none'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; manifest-src 'self'; img-src 'self'; script-src 'self'; style-src 'self'";
+const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; base-uri 'none'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; manifest-src 'self'; img-src 'self' https:; script-src 'self'; style-src 'self'";
 const MAX_JSON_BODY_BYTES: usize = 16 * 1024;
 const MAX_MULTIPART_BODY_BYTES: usize = MAX_IMAGE_BYTES + MAX_JSON_BODY_BYTES;
 const MAX_TEXT_PART_BYTES: usize = 2048;
@@ -593,6 +593,7 @@ mod tests {
             CONTENT_SECURITY_POLICY
         );
         assert!(CONTENT_SECURITY_POLICY.contains("manifest-src 'self'"));
+        assert!(CONTENT_SECURITY_POLICY.contains("img-src 'self' https:"));
 
         let response = app
             .clone()

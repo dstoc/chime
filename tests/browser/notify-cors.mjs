@@ -19,12 +19,15 @@ const dataDirectory = path.join(workspace, 'data');
 const databasePath = path.join(dataDirectory, 'chime.sqlite3');
 const serviceOutput = [];
 const requests = [];
+const imageRequests = [];
 let service;
 let browser;
 let proxy;
 let sender;
 let socket;
 let devtoolsPort;
+let serviceWorkerRegistrationId = null;
+const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/nqsAAAAASUVORK5CYII=', 'base64');
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function freePort() {
@@ -122,7 +125,24 @@ try {
     proxy.once('error', reject);
     proxy.listen(apiPort, '127.0.0.1', resolve);
   });
-  sender = https.createServer(tls, (_request, response) => {
+  sender = https.createServer(tls, (request, response) => {
+    const imagePath = new URL(request.url, senderOrigin).pathname;
+    if (imagePath === '/external-image.png') {
+      imageRequests.push({ path: imagePath, status: 200 });
+      response.writeHead(200, {
+        'Access-Control-Allow-Origin': '*',
+        'Cache-Control': 'no-store',
+        'Content-Type': 'image/png',
+      });
+      response.end(png);
+      return;
+    }
+    if (imagePath === '/missing-image.png') {
+      imageRequests.push({ path: imagePath, status: 404 });
+      response.writeHead(404, { 'Cache-Control': 'no-store' });
+      response.end();
+      return;
+    }
     response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     response.end('<!doctype html><title>Cross origin sender</title>');
   });
@@ -169,6 +189,10 @@ try {
   const pending = new Map();
   socket.addEventListener('message', (event) => {
     const message = JSON.parse(event.data);
+    if (message.method === 'ServiceWorker.workerRegistrationUpdated') {
+      const registration = message.params.registrations.find((entry) => entry.scopeURL === `${apiOrigin}/` && !entry.isDeleted);
+      if (registration) serviceWorkerRegistrationId = registration.registrationId;
+    }
     if (message.id && pending.has(message.id)) {
       const { resolve, reject } = pending.get(message.id);
       pending.delete(message.id);
@@ -248,12 +272,69 @@ try {
       ?.responseHeaders?.allowMethods !== 'POST, OPTIONS') {
     throw new Error(`browser did not exercise the expected preflight/send paths: ${JSON.stringify(requests)}`);
   }
+
+  await cdp('Page.navigate', { url: apiOrigin });
+  await sleep(250);
+  const serviceWorkerCsp = await evaluate(`(async () => {
+    const response = await fetch('/sw.js', { cache: 'no-store' });
+    return response.headers.get('content-security-policy');
+  })()`);
+  if (!serviceWorkerCsp?.includes("img-src 'self' https:")) {
+    throw new Error(`service worker response does not permit HTTPS images: ${serviceWorkerCsp}`);
+  }
+  await cdp('Browser.grantPermissions', { origin: apiOrigin, permissions: ['notifications'] });
+  await cdp('ServiceWorker.enable');
+  await evaluate(`navigator.serviceWorker.register('/sw.js', { type: 'module' }).then(() => navigator.serviceWorker.ready)`);
+  for (let attempt = 0; attempt < 100 && !serviceWorkerRegistrationId; attempt += 1) await sleep(50);
+  if (!serviceWorkerRegistrationId) throw new Error('service worker did not register with Chromium');
+
+  async function deliverImagePush(id, imagePath) {
+    const payload = {
+      version: 1,
+      id,
+      title: 'Image notification',
+      body: 'Text remains useful if the image fails.',
+      image_url: `${senderOrigin}${imagePath}?id=${id}`,
+      url: null,
+      expires_at: Math.floor(Date.now() / 1000) + 3600,
+      ack_capability: 'A'.repeat(43),
+    };
+    await cdp('ServiceWorker.deliverPushMessage', {
+      origin: apiOrigin,
+      registrationId: serviceWorkerRegistrationId,
+      data: JSON.stringify(payload),
+    });
+    const deadline = Date.now() + 8000;
+    while (Date.now() < deadline && !imageRequests.some((request) => request.path === imagePath)) await sleep(50);
+    if (!imageRequests.some((request) => request.path === imagePath)) {
+      throw new Error(`browser did not request ${payload.image_url}; CSP was ${serviceWorkerCsp}`);
+    }
+    return evaluate(`(async () => {
+      const registration = await navigator.serviceWorker.ready;
+      const notifications = await registration.getNotifications({ tag: ${JSON.stringify(`chime-${id}`)} });
+      return notifications.map((item) => ({ title: item.title, body: item.body, image: item.image }));
+    })()`);
+  }
+
+  const externalImageNotification = await deliverImagePush('CCCCCCCCCCCCCCCCCCCCCC', '/external-image.png');
+  const missingImageNotification = await deliverImagePush('DDDDDDDDDDDDDDDDDDDDDD', '/missing-image.png');
+  if (imageRequests.find((request) => request.path === '/external-image.png')?.status !== 200
+    || externalImageNotification.length !== 1
+    || externalImageNotification[0].body !== 'Text remains useful if the image fails.'
+    || imageRequests.find((request) => request.path === '/missing-image.png')?.status !== 404
+    || missingImageNotification.length !== 1
+    || missingImageNotification[0].body !== 'Text remains useful if the image fails.') {
+    throw new Error(`external image behavior mismatch: ${JSON.stringify({ imageRequests, externalImageNotification, missingImageNotification })}`);
+  }
   console.log(JSON.stringify({
     browser: chromeVersion,
     senderOrigin,
     apiOrigin,
     result,
     requests,
+    serviceWorkerCsp,
+    imageRequests,
+    imageNotifications: { externalImageNotification, missingImageNotification },
     networkPermission: 'not exercised: both test origins use loopback; verify tailnet local-network permission on target Chrome devices',
   }, null, 2));
 } catch (error) {
