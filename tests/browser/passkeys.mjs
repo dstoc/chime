@@ -450,10 +450,61 @@ const payloadValidation = await evaluate(`(async () => {
   } }, valid);
   const opened = [];
   let closeCount = 0;
-  await worker.openNotificationUrl({ data: { url: valid.url }, close: () => { closeCount += 1; } }, async (url) => opened.push(url));
-  await worker.openNotificationUrl({ data: { url: 'javascript:alert(1)' }, close: () => { closeCount += 1; } }, async (url) => opened.push(url));
+  await worker.openNotificationUrl({ data: valid, close: () => { closeCount += 1; } }, async (url) => opened.push(url));
+  await worker.openNotificationUrl({ data: { ...valid, url: 'javascript:alert(1)' }, close: () => { closeCount += 1; } }, async (url) => opened.push(url));
   let noUrlCloseCount = 0;
   const noUrlOpened = await worker.openNotificationUrl({ data: {}, close: () => { noUrlCloseCount += 1; } }, async (url) => opened.push(url));
+
+  const uploadedImageUrl = 'https://chime.example.invalid/api/images/' + 'U'.repeat(43);
+  const externalImageUrl = 'https://images.example.invalid/build.png';
+  const targetCases = [
+    { name: 'explicit url with body and image', body: valid.body, image_url: externalImageUrl, url: 'https://example.com/explicit-body', expected: 'https://example.com/explicit-body' },
+    { name: 'explicit url without body and with image', body: null, image_url: uploadedImageUrl, url: 'https://example.com/explicit-image', expected: 'https://example.com/explicit-image' },
+    { name: 'uploaded image with absent body', body: undefined, image_url: uploadedImageUrl, url: null, expected: uploadedImageUrl },
+    { name: 'uploaded image with empty body', body: '', image_url: uploadedImageUrl, url: null, expected: uploadedImageUrl },
+    { name: 'external image with absent body', body: undefined, image_url: externalImageUrl, url: null, expected: externalImageUrl },
+    { name: 'external image with empty body', body: '', image_url: externalImageUrl, url: null, expected: externalImageUrl },
+    { name: 'external image with null body', body: null, image_url: externalImageUrl, url: null, expected: externalImageUrl },
+    { name: 'whitespace body', body: ' ', image_url: externalImageUrl, url: null, expected: null },
+    { name: 'nonempty body', body: 'Build completed', image_url: externalImageUrl, url: null, expected: null },
+    { name: 'no image or url', body: null, image_url: null, url: null, expected: null },
+    { name: 'invalid explicit url', body: '', image_url: uploadedImageUrl, url: 'javascript:alert(1)', expected: null },
+    { name: 'invalid image url', body: '', image_url: 'javascript:alert(1)', url: null, expected: null },
+  ];
+  const targetResults = [];
+  for (const [index, targetCase] of targetCases.entries()) {
+    const payload = {
+      ...valid,
+      id: String.fromCharCode(65 + index).repeat(22),
+      ack_capability: String.fromCharCode(65 + index).repeat(43),
+      ...targetCase,
+    };
+    delete payload.name;
+    delete payload.expected;
+    let displayed;
+    await worker.displayPayload({ showNotification: async (_title, options) => { displayed = structuredClone(options); } }, payload, async () => false);
+    const urls = [];
+    let closed = false;
+    await worker.openNotificationUrl(
+      { data: displayed.data, close: () => { closed = true; } },
+      async (url) => urls.push(url),
+    );
+    targetResults.push({ name: targetCase.name, expected: targetCase.expected, actual: urls[0] ?? null, closed });
+  }
+  let malformedDisplay;
+  await worker.displayPayload({ showNotification: async (_title, options) => { malformedDisplay = structuredClone(options); } }, {
+    ...valid, id: 'Z'.repeat(22), body: '', url: null, image_url: 'javascript:alert(1)',
+  }, async () => false);
+  let malformedOpened = false;
+  await worker.openNotificationUrl(
+    { data: malformedDisplay.data, close: () => {} },
+    () => { malformedOpened = true; },
+  );
+  let expiredImageTarget = null;
+  await worker.openNotificationUrl({
+    data: { ...valid, body: '', image_url: uploadedImageUrl, url: null, expires_at: 1 },
+    close: () => {},
+  }, (url) => { expiredImageTarget = url; });
   const tokens = await import('/device-token.js');
   const deviceToken = 'chime_dt_' + 'A'.repeat(43);
   await tokens.saveDeviceCredentials('fixture-device', deviceToken);
@@ -476,6 +527,11 @@ const payloadValidation = await evaluate(`(async () => {
       ack_capability: valid.ack_capability,
       expires_at: valid.expires_at,
       url: valid.url,
+      type: valid.type,
+      version: valid.version,
+      title: valid.title,
+      body: valid.body,
+      image_url: valid.image_url,
     }, close: () => clickOrder.push('close') },
     (url) => { clickOrder.push('open'); return Promise.resolve(url); },
     () => {
@@ -500,8 +556,13 @@ const payloadValidation = await evaluate(`(async () => {
     unsafeImage: validatePayload({ ...valid, image_url: 'javascript:alert(1)' }),
     unsafeClick: validatePayload({ ...valid, url: 'https://user:pass@example.com/' }),
     imageFallback: calls.length === 2 && calls[0].options.image === valid.image_url
-      && calls[1].options.image === undefined && calls[1].options.body === valid.body,
+      && calls[1].options.image === undefined && calls[1].options.body === valid.body
+      && calls[0].options.data.image_url === valid.image_url,
     click: opened.length === 1 && opened[0] === valid.url && closeCount === 2,
+    clickTargets: targetResults.filter((result) => result.actual !== result.expected || !result.closed),
+    malformedNotificationDidNotNavigate: malformedDisplay.data === undefined && !malformedOpened,
+    expiredImageTarget,
+    expiredImageStillUsesExistingUrl: expiredImageTarget === uploadedImageUrl,
     openedImmediately,
     openedBeforeAckCompleted,
     noUrlClosedWithoutNavigation: noUrlOpened === null && noUrlCloseCount === 1 && opened.length === 1,
@@ -515,7 +576,9 @@ if (!payloadValidation.valid || !payloadValidation.dismissVariant || payloadVali
   || payloadValidation.unsafeExtra || payloadValidation.unsafeImage || payloadValidation.unsafeClick
   || !payloadValidation.imageFallback || !payloadValidation.click || !payloadValidation.openedBeforeAckCompleted
   || !payloadValidation.openedImmediately
-  || !payloadValidation.noUrlClosedWithoutNavigation || !payloadValidation.acknowledgementHeaderOnly) {
+  || !payloadValidation.noUrlClosedWithoutNavigation || !payloadValidation.acknowledgementHeaderOnly
+  || payloadValidation.clickTargets.length !== 0 || !payloadValidation.malformedNotificationDidNotNavigate
+  || !payloadValidation.expiredImageStillUsesExistingUrl) {
   throw new Error(`service-worker payload validation failed: ${JSON.stringify(payloadValidation)}`);
 }
 const dismissalBrowserChecks = await evaluate(`(async () => {
@@ -798,10 +861,15 @@ const notificationCloseBrowserChecks = await evaluate(`(async () => {
 
   const clickId = 'M'.repeat(22);
   const clickData = {
+    type: 'notify',
+    version: 1,
     id: clickId,
+    title: 'Image only',
+    body: '',
+    image_url: 'https://images.example.invalid/click.png',
     ack_capability: 'M'.repeat(43),
     expires_at: now + 3500,
-    url: 'https://example.com/manual-dismissal',
+    url: null,
   };
   let matchingClickCount = 0;
   visible.set('chime-' + clickId, { close: () => { matchingClickCount += 1; } });
@@ -820,7 +888,7 @@ const notificationCloseBrowserChecks = await evaluate(`(async () => {
     waitUntil: (work) => clickWaitUntil.push(work),
   });
   const clickOpenedImmediately = clickedNotificationClosed
-    && openedUrls.length === 1 && openedUrls[0] === clickData.url;
+    && openedUrls.length === 1 && openedUrls[0] === clickData.image_url;
   await clickFetchStarted;
   const clickOpenedBeforeAcknowledgement = clickOpenedImmediately && requests.length === 2;
   releaseClickFetch();
@@ -966,7 +1034,8 @@ const displayedPush = await evaluate(`(async () => {
 if (displayedPush.length !== 1 || displayedPush[0].title !== 'Build complete'
   || displayedPush[0].body !== 'All checks passed'
   || displayedPush[0].image !== validPushPayload.image_url
-  || displayedPush[0].data.url !== validPushPayload.url) {
+  || displayedPush[0].data.url !== validPushPayload.url
+  || displayedPush[0].data.image_url !== validPushPayload.image_url) {
   throw new Error(`valid push was not displayed as text: ${JSON.stringify(displayedPush)}`);
 }
 const dismissPushPayload = {

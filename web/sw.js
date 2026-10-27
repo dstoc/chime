@@ -56,7 +56,17 @@ export async function handlePushPayload(registration, payload, rememberDismissed
 }
 
 export function openNotificationUrl(notification, openWindow) {
-  const url = notification.data?.url;
+  const data = notification.data;
+  let url = null;
+  const validNotifyData = validateNotifyClickData(data);
+  if (validNotifyData || validateLegacyClickData(data)) {
+    if (data.url !== null && data.url !== undefined) {
+      url = data.url;
+    } else if (validNotifyData && (data.body === null || data.body === undefined || data.body === "")
+      && data.image_url !== null && data.image_url !== undefined) {
+      url = data.image_url;
+    }
+  }
   notification.close();
   if (typeof url === "string" && validHttpsUrl(url)) return openWindow(url);
   return null;
@@ -131,12 +141,7 @@ export async function displayPayload(registration, payload, hasDismissed = isNot
     ? {
         body: payload.body || "",
         tag: `chime-${payload.id}`,
-        data: {
-          id: payload.id,
-          ack_capability: payload.ack_capability,
-          expires_at: payload.expires_at,
-          url: payload.url || null,
-        },
+        data: { ...payload },
       }
     : { body: "A notification could not be displayed." };
   if (valid && payload.image_url) options.image = payload.image_url;
@@ -155,6 +160,10 @@ export function validatePayload(payload) {
 }
 
 export function validateNotifyPayload(payload) {
+  return validateNotifyClickData(payload) && validExpiry(payload.expires_at);
+}
+
+function validateNotifyClickData(payload) {
   if (!isPlainObject(payload) || payload.type !== "notify") return false;
   if (Object.keys(payload).some((field) => !NOTIFY_FIELDS.includes(field))) return false;
   if (payload.version !== 1 || typeof payload.title !== "string") return false;
@@ -164,7 +173,19 @@ export function validateNotifyPayload(payload) {
   if (payload.image_url !== null && payload.image_url !== undefined && !validHttpsUrl(payload.image_url)) return false;
   if (payload.url !== null && payload.url !== undefined && !validHttpsUrl(payload.url)) return false;
   if (!validId(payload.id) || !validCapability(payload.ack_capability)) return false;
-  return validExpiry(payload.expires_at);
+  return Number.isSafeInteger(payload.expires_at) && payload.expires_at > 0;
+}
+
+function validateLegacyClickData(data) {
+  const fields = ["ack_capability", "expires_at", "id", "url"];
+  return isPlainObject(data)
+    && Object.keys(data).length === fields.length
+    && Object.keys(data).every((field) => fields.includes(field))
+    && validId(data.id)
+    && validCapability(data.ack_capability)
+    && Number.isSafeInteger(data.expires_at)
+    && data.expires_at > 0
+    && (data.url === null || validHttpsUrl(data.url));
 }
 
 export function validateDismissPayload(payload) {
