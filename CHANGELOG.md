@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/dstoc/chime/compare/v0.3.0...v0.4.0) (2026-10-27)
+
+
+### Features
+
+* open image URLs for image-only notification clicks ([#21](https://github.com/dstoc/chime/issues/21)) ([f7d4cd0](https://github.com/dstoc/chime/commit/f7d4cd0da95ec5ad7d356aa36e782bc35a90d648))
+
 ## [0.3.0](https://github.com/dstoc/chime/compare/v0.2.0...v0.3.0) (2026-10-26)
 
 
